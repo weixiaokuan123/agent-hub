@@ -1,0 +1,28 @@
+# ===== 隐私 / 密钥（绝不入库）=====
+keys/*.key
+logs/*
+!logs/.gitkeep
+state/*
+!state/.gitkeep
+scripts/start-silent.vbs
+
+# ===== 用户本地配置 =====
+opencode.jsonc
+opencode.jsonc.bak*
+*.bak
+*.bak.*
+.env
+.env.*
+
+# ===== Node =====
+node_modules/
+npm-debug.log*
+dist/
+build/
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

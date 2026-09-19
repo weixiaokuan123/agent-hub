@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Hub · 本地账号与签到面板</title>
+<style>
+  :root {
+    --bg: #0f1115; --card: #171a21; --card2: #1e222b; --line: #2a2f3a;
+    --fg: #e6e9ef; --dim: #8b93a7; --accent: #5b8cff; --ok: #35c98a;
+    --warn: #e0a234; --err: #e05252; --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  header { padding: 20px 24px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: .2px; }
+  header .sp { flex: 1; }
+  .muted { color: var(--dim); font-size: 12.5px; }
+  button { background: var(--card2); color: var(--fg); border: 1px solid var(--line);
+    padding: 7px 14px; border-radius: 9px; cursor: pointer; font-size: 13px; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  main { padding: 20px 24px 60px; max-width: 1200px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; }
+  .card h2 { margin: 0 0 2px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; }
+  .row .k { color: var(--dim); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .ok { background: var(--ok); } .off { background: #4a5060; } .warn { background: var(--warn); } .err { background: var(--err); }
+  .tag { font-size: 11.5px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); }
+  .signin-box { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--line); }
+  .streak { font-size: 22px; font-weight: 700; }
+  .big { font-size: 16px; font-weight: 650; }
+  .footer-note { margin-top: 26px; }
+  code { background: var(--card2); padding: 1px 6px; border-radius: 6px; font-size: 12.5px; }
+  #toast { position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 8px; }
+  .toast { background: var(--card2); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    padding: 10px 14px; border-radius: 9px; max-width: 360px; font-size: 13px; }
+  .toast.err { border-left-color: var(--err); }
+  .toast.ok { border-left-color: var(--ok); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Agent Hub</h1>
+  <span class="tag" id="keyTag">未连接</span>
+  <span class="sp"></span>
+  <span class="muted" id="updated"></span>
+  <button onclick="refresh()">刷新</button>
+  <button class="primary" onclick="claimAll()">全部签到</button>
+</header>
+<main>
+  <div class="grid" id="grid"></div>
+  <p class="muted footer-note">
+    数据来自本机三个代理的回环接口（WorkBuddy 39301/39302、Trae 39303/39304、MiniMax 39305/39306）。
+    本面板不接触任何凭据，只做聚合展示与「立即签到」。自动签到默认每天 7–10 点随机执行，由各代理自身完成。
+  </p>
+</main>
+<div id="toast"></div>
+<script>
+const LS_KEY = 'agent-hub-key'
+let HUB_KEY = localStorage.getItem(LS_KEY) || ''
+
+// 首次通过 ?key= 带入并保存
+const urlKey = new URLSearchParams(location.search).get('key')
+if (urlKey) {
+  HUB_KEY = urlKey
+  localStorage.setItem(LS_KEY, urlKey)
+  history.replaceState({}, '', location.pathname)
+}
+
+function toast(msg, kind = '') {
+  const el = document.createElement('div')
+  el.className = 'toast ' + kind
+  el.textContent = msg
+  document.getElementById('toast').appendChild(el)
+  setTimeout(() => el.remove(), 5000)
+}
+
+async function api(path, method = 'GET', body) {
+  const res = await fetch(path, {
+    method,
+    headers: { Authorization: 'Bearer ' + HUB_KEY, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  if (res.status === 401) throw new Error('面板 key 无效或缺失')
+  const data = await res.json().catch(() => null)
+  if (!res.ok) throw new Error((data && (data.error || data.message)) || ('HTTP ' + res.status))
+  return data
+}
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])) }
+
+function authOf(r) {
+  const a = r.auth || {}
+  if (r.running === false) return { cls: 'off', text: '服务未运行' }
+  if (a.state === 'signed-in') return { cls: 'ok', text: '已登录 ' + esc(a.account || a.uin || '') }
+  if (a.state === 'expired') return { cls: 'warn', text: 'token 已过期' }
+  if (a.state === 'signed-out') return { cls: 'off', text: '未登录' }
+  if (a.state === 'no-key') return { cls: 'warn', text: '缺 key（首次启动后重试）' }
+  return { cls: 'err', text: esc(a.message || a.state || '未知') }
+}
+
+function signinHtml(r) {
+  if (!r.signin) return '<div class="row muted">签到：不可用</div>'
+  if (r.signin.error) return '<div class="row muted">签到：' + esc(r.signin.error) + '</div>'
+  const s = r.signin
+  // 三种代理字段不同，这里做归一
+  const raw = s.view || {}
+  const nest = raw.panel || {}          // MiniMax: view.panel.{checkedInToday,streak,todayPoints}
+  const inner = raw.panel?.panel || {}
+  const checkedIn = raw.checkedIn === true || raw.todayCheckedIn === true || nest.checkedInToday === true
+  const enabled = raw.enabled !== false && raw.active !== false
+  const credits = raw.credits ?? raw.todayCredit ?? nest.todayPoints ?? 0
+  const extra = raw.extraCredits ?? 0
+  const streak = raw.streakDays ?? nest.streak ?? 0
+
+  const state = checkedIn ? '<span class="dot ok"></span> 今日已签'
+    : (enabled ? '<span class="dot warn"></span> 今日未签' : '<span class="dot off"></span> 活动未开启')
+  return `
+    <div class="signin-box">
+      <div class="row"><span class="k">签到状态</span><span>${state}</span></div>
+      <div class="row"><span class="k">获得积分</span><span class="big">${credits}${extra ? ' + ' + extra : ''}${streak ? ' · 连签' + streak : ''}</span></div>
+      <div class="row"><span class="k">今日计划时刻</span><span>${esc(s.scheduledAt || '-')}</span></div>
+      ${s.lastResult ? `<div class="row"><span class="k">最近结果</span><span class="muted">${esc(s.lastResult)}</span></div>` : ''}
+      <div class="row" style="margin-top:8px">
+        <span></span>
+        <button onclick="claim('${r.id}')" ${checkedIn ? 'disabled' : ''}>立即签到</button>
+      </div>
+    </div>`
+}
+
+function card(r) {
+  const a = authOf(r)
+  const models = Array.isArray(r.models) ? r.models.length : (r.models ?? '-')
+  return `
+    <div class="card">
+      <h2><span class="dot ${a.cls}"></span> ${esc(r.provider)} <span class="tag">${esc(r.label)}</span></h2>
+      <div class="muted" style="margin-bottom:10px">端口 ${r.port}</div>
+      <div class="row"><span class="k">账号</span><span>${a.text}</span></div>
+      <div class="row"><span class="k">模型数</span><span>${models}</span></div>
+      ${signinHtml(r)}
+    </div>`
+}
+
+async function refresh() {
+  if (!HUB_KEY) { document.getElementById('keyTag').textContent = '缺少 key'; return }
+  try {
+    const data = await api('/api/overview')
+    document.getElementById('keyTag').textContent = '已连接'
+    document.getElementById('grid').innerHTML = data.regions.map(card).join('')
+    document.getElementById('updated').textContent = '更新于 ' + new Date(data.at).toLocaleTimeString()
+  } catch (e) {
+    toast('刷新失败：' + e.message, 'err')
+    document.getElementById('keyTag').textContent = '连接失败'
+  }
+}
+
+async function claim(id) {
+  try {
+    const r = await api('/api/signin/claim', 'POST', { id })
+    toast(id + '：' + (r.entry?.result || '已处理'), 'ok')
+    refresh()
+  } catch (e) { toast(id + ' 签到失败：' + e.message, 'err') }
+}
+
+async function claimAll() {
+  try {
+    const data = await api('/api/overview')
+    const targets = data.regions.filter(r => r.signin && !r.signin.error && r.signin.view && !r.signin.view.checkedIn)
+    if (!targets.length) { toast('没有需要签到的平台'); return }
+    for (const t of targets) { await claim(t.id) }
+  } catch (e) { toast('批量签到失败：' + e.message, 'err') }
+}
+
+refresh()
+setInterval(refresh, 60000)
+</script>
+</body>
+</html>
