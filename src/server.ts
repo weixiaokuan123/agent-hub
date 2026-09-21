@@ -19,6 +19,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { Socket } from 'node:net'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { AGENT_HUB_VERSION } from './version.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
@@ -47,6 +48,15 @@ const REGIONS: RegionDef[] = [
   { id: 'minimax-cn', provider: 'MiniMax', label: '国内版', port: 39305, keyName: 'minimax-proxy/keys/cn.key', supportsSignin: true },
   { id: 'minimax-en', provider: 'MiniMax', label: '国际版', port: 39306, keyName: 'minimax-proxy/keys/en.key', supportsSignin: true },
 ]
+
+/** 可自动更新的本地仓库（owner/name 与本地目录、健康检查端口）。 */
+const UPDATABLE: Array<{ name: string; repo: string; dirName: string; port: number; keyName: string }> = [
+  { name: 'workbuddy-proxy', repo: 'weixiaokuan123/workbuddy-proxy', dirName: 'workbuddy-proxy', port: 39301, keyName: 'workbuddy-proxy/keys/cn.key' },
+  { name: 'trae-proxy', repo: 'weixiaokuan123/trae-proxy', dirName: 'trae-proxy', port: 39303, keyName: 'trae-proxy/keys/cn.key' },
+  { name: 'minimax-proxy', repo: 'weixiaokuan123/minimax-proxy', dirName: 'minimax-proxy', port: 39305, keyName: 'minimax-proxy/keys/cn.key' },
+]
+const UPDATE_PENDING_FILE = join(ROOT, 'state', 'update-pending.json')
+const UPDATE_CHECK_MS = 24 * 60 * 60 * 1000
 
 function ts(): string {
   return new Date().toISOString()
@@ -100,13 +110,66 @@ async function fetchJson(url: string, key: string, method = 'GET', timeoutMs = 2
 async function probePort(port: number): Promise<boolean> {
   const net = await import('node:net')
   return await new Promise<boolean>((resolve) => {
+    let settled = false
     const socket = net.connect({ host: HOST, port })
-    const done = (v: boolean): void => { socket.destroy(); resolve(v) }
+    const done = (v: boolean): void => {
+      if (settled) return // 只 resolve 一次，避免 connect 后又来 error/timeout
+      settled = true
+      socket.removeAllListeners()
+      socket.destroy()
+      resolve(v)
+    }
     socket.setTimeout(1200)
     socket.once('connect', () => done(true))
     socket.once('timeout', () => done(false))
     socket.once('error', () => done(false))
   })
+}
+
+/** 从代理 /healthz 读取当前版本（需带该代理的 bearer，healthz 受鉴权保护）。 */
+async function readCurrentVersion(port: number, keyName: string): Promise<string | undefined> {
+  try {
+    const key = await readRegionKey({ keyName } as RegionDef)
+    if (key === null) return undefined
+    const res = await fetch(`http://${HOST}:${port}/healthz`, {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!res.ok) return undefined
+    const j = await res.json() as { version?: string }
+    return j.version
+  } catch {
+    return undefined
+  }
+}
+
+/** 检查（可选并执行）所有仓库更新；force=true 时真正 git 快进，否则只报告。 */
+async function checkUpdates(force: boolean): Promise<unknown> {
+  const specs = []
+  for (const u of UPDATABLE) {
+    const currentVersion = await readCurrentVersion(u.port, u.keyName)
+    if (currentVersion === undefined) continue // 代理没启动，跳过
+    specs.push({
+      name: u.name,
+      repo: u.repo,
+      dir: join(ROOT, '..', u.dirName),
+      currentVersion,
+    })
+  }
+  if (!force) {
+    // 只检查版本（不拉取、不写盘）
+    const { peekLatestTag } = await import('./updater.ts')
+    const repos = []
+    for (const s of specs) {
+      const latest = (await peekLatestTag(s.repo)) ?? s.currentVersion
+      const { isNewer } = await import('./updater.ts')
+      repos.push({ name: s.name, current: s.currentVersion, latest, hasUpdate: isNewer(latest, s.currentVersion) })
+    }
+    return { mode: 'check', repos }
+  }
+  const { checkAll } = await import('./updater.ts')
+  const results = await checkAll(specs, UPDATE_PENDING_FILE, m => log('info', m))
+  return { mode: 'update', results }
 }
 
 async function overview(): Promise<unknown> {
@@ -188,7 +251,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return
   }
   if (req.method === 'GET' && url === '/healthz') {
-    res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true })); return
+    res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, version: AGENT_HUB_VERSION })); return
   }
   if (!authed(req)) {
     res.writeHead(401, { 'Content-Type': 'application/json' })
@@ -213,6 +276,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const result = await claim(id)
       res.writeHead(result.ok ? 200 : 502, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(result)); return
+    }
+    if (req.method === 'GET' && url === '/api/update/check') {
+      const data = await checkUpdates(false)
+      res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
+    }
+    if (req.method === 'POST' && url === '/api/update/apply') {
+      const data = await checkUpdates(true)
+      res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
     }
     res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'not found' }))
   } catch (error) {
@@ -243,6 +314,14 @@ async function main(): Promise<void> {
 
   log('info', `agent-hub 已监听 http://${HOST}:${PORT}`)
   log('info', `首次访问请带上 key：http://${HOST}:${PORT}/?key=${HUB_KEY}`)
+
+  // 每日自动检查更新：启动 30 秒后查一次，之后每 24 小时一次。
+  // 只做 git 快进（ff-only），有更新会写 state/update-pending.json，重启代理后生效。
+  if ((process.env['OPCODE_NO_AUTO_UPDATE'] ?? '') === '') {
+    setTimeout(() => { void checkUpdates(true).catch(() => {}) }, 30_000).unref?.()
+    const updateTimer = setInterval(() => { void checkUpdates(true).catch(() => {}) }, UPDATE_CHECK_MS)
+    updateTimer.unref?.()
+  }
 
   const shutdown = (): void => { for (const s of sockets) s.destroy(); server.close(); process.exit(0) }
   process.on('SIGINT', shutdown)
