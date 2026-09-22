@@ -222,8 +222,27 @@ async function claimAll() {
   } catch (e) { toast('批量签到失败：' + e.message, 'err') }
 }
 
+// 自动刷新：5 分钟一次；标签页不可见时暂停，切回时立即刷新一次。
+// 面板每次刷新都会向 WorkBuddy/Trae 上游查询余额，降低频率可避免频繁调用。
+const REFRESH_MS = 5 * 60 * 1000
+let refreshTimer = null
+
+function startAutoRefresh() {
+  if (refreshTimer !== null) return
+  refreshTimer = setInterval(() => { if (!document.hidden) refresh() }, REFRESH_MS)
+}
+
+function stopAutoRefresh() {
+  if (refreshTimer !== null) { clearInterval(refreshTimer); refreshTimer = null }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { stopAutoRefresh() }
+  else { refresh(); startAutoRefresh() }
+})
+
 refresh()
-setInterval(refresh, 60000)
+startAutoRefresh()
 </script>
 </body>
 </html>

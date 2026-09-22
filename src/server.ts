@@ -107,7 +107,8 @@ async function fetchJson(url: string, key: string, method = 'GET', timeoutMs = 2
 }
 
 /**
- * WorkBuddy 积分汇总：live 国内(39301) + 多账号(state 目录下 acct-*.key，端口 39320+ i)。
+ * WorkBuddy 积分汇总：live 国内(39301) + live 国际(39302) + 多账号
+ * (keys 目录下 acct-*.key，端口 39320+ i)。缺失的 key 文件自动跳过。
  *
  * live 端口的登录态可能与某个 acct 账号是同一个号（例如桌面端切到账号B 后，
  * live 也变成账号B），若直接累加会把同一账号算两次。因此先查各端口 /status
@@ -126,22 +127,20 @@ interface WorkBuddyCreditEntry {
 }
 
 async function workbuddyCredits(): Promise<{ entries: WorkBuddyCreditEntry[]; total: number; note?: string }> {
-  const specs: Array<{ label: string; port: number; keyFile: string }> = [
-    { label: '账号A', port: 39301, keyFile: 'workbuddy-proxy/keys/cn.key' },
-  ]
+  let keyFiles: string[] = []
+  try { keyFiles = await readdir(join(ROOT, '..', 'workbuddy-proxy', 'keys')) } catch { /* keys 目录缺失 */ }
+  const specs: Array<{ label: string; port: number; keyFile: string }> = []
+  if (keyFiles.includes('cn.key')) specs.push({ label: '国内版', port: 39301, keyFile: 'workbuddy-proxy/keys/cn.key' })
+  if (keyFiles.includes('global.key')) specs.push({ label: '国际版', port: 39302, keyFile: 'workbuddy-proxy/keys/global.key' })
   // acct-0, acct-1, ... → 端口 39320, 39321, ...
-  try {
-    const keyDir = join(ROOT, '..', 'workbuddy-proxy', 'keys')
-    const files = await readdir(keyDir)
-    const acct = files
-      .map(f => /^acct-(\d+)\.key$/.exec(f))
-      .filter((m): m is RegExpExecArray => m !== null)
-      .map(m => Number(m[1]))
-      .sort((a, b) => a - b)
-    for (const i of acct) {
-      specs.push({ label: `账号${String.fromCharCode(66 + i)}`, port: 39320 + i, keyFile: `workbuddy-proxy/keys/acct-${i}.key` })
-    }
-  } catch { /* keys 目录缺失时只保留 live */ }
+  const acct = keyFiles
+    .map(f => /^acct-(\d+)\.key$/.exec(f))
+    .filter((m): m is RegExpExecArray => m !== null)
+    .map(m => Number(m[1]))
+    .sort((a, b) => a - b)
+  for (const i of acct) {
+    specs.push({ label: `账号${String.fromCharCode(66 + i)}`, port: 39320 + i, keyFile: `workbuddy-proxy/keys/acct-${i}.key` })
+  }
 
   const raw = await Promise.all(specs.map(async (s): Promise<WorkBuddyCreditEntry> => {
     try {
