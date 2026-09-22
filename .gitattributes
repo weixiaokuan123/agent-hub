@@ -1,9 +1,11 @@
 # 统一以 LF 存库，避免跨平台 diff 噪音
 * text=auto eol=lf
 
-# Windows 脚本保持 CRLF（PowerShell 5.1 对行尾/编码敏感）
+# Windows 脚本保持 CRLF（PowerShell 5.1 对行尾/编码敏感；cmd.exe 遇裸 LF 会解析错误）
 *.ps1 text eol=crlf
 *.vbs text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
 
 # 二进制
 *.png binary

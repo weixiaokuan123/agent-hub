@@ -1,29 +1,26 @@
 @echo off
 rem ============================================================
-rem  agent-hub ä¸€é”®æ‰“å¼€ï¼ˆåŒå‡»å³å¯ï¼‰
-rem  ä½œç”¨ï¼šç¡®ä¿åŽå°æœåŠ¡åœ¨è¿è¡Œï¼Œç„¶åŽç”¨ï¼ˆå¸¦æœ¬åœ° key çš„ï¼‰åœ°å€æ‰“å¼€æµè§ˆå™¨ã€‚
-rem  æœ¬è„šæœ¬ä¸åŒ…å«ä»»ä½•å¯†é’¥ï¼›key åœ¨è¿è¡Œæ—¶ä»Ž keys\hub.key è¯»å–ã€‚
+rem  agent-hub Ò»¼ü´ò¿ª£¨Ë«»÷¼´¿É£©
+rem  ×÷ÓÃ£ºÈ·±£ºóÌ¨·þÎñÔÚÔËÐÐ£¬È»ºóÓÃ£¨´ø±¾µØ key µÄ£©µØÖ·´ò¿ªä¯ÀÀÆ÷¡£
+rem  ±¾½Å±¾²»°üº¬ÈÎºÎÃÜÔ¿£»key ÔÚÔËÐÐÊ±´Ó keys\hub.key ¶ÁÈ¡¡£
 rem ============================================================
 setlocal
-chcp 65001 >nul
 set "ROOT=%~dp0"
-set "PS=powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\start.ps1""
+set "STARTER=%ROOT%scripts\start.ps1"
 
-echo [1/2] æ­£åœ¨ç¡®ä¿ agent-hub æœåŠ¡è¿è¡Œ...
-%PS%
+echo [1/2] ÕýÔÚÈ·±£ agent-hub ·þÎñÔËÐÐ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%STARTER%"
 
 echo.
-echo [2/2] æ­£åœ¨æ‰“å¼€ä»ªè¡¨ç›˜...
+echo [2/2] ÕýÔÚ´ò¿ªÒÇ±íÅÌ...
 if not exist "%ROOT%keys\hub.key" (
-  echo [é”™è¯¯] æœªæ‰¾åˆ° keys\hub.keyï¼Œè¯·å…ˆè¿è¡Œä¸€æ¬¡ scripts\start.ps1 ç”Ÿæˆã€‚
+  echo [´íÎó] Î´ÕÒµ½ keys\hub.key£¬ÇëÏÈÔËÐÐÒ»´Î scripts\start.ps1 Éú³É¡£
   pause
   exit /b 1
 )
 
-rem ç”¨ PowerShell è¯»å– key å¹¶æ‰“å¼€æµè§ˆå™¨ï¼ˆé¿å…åœ¨ cmd é‡Œå¤„ç†ç‰¹æ®Šå­—ç¬¦ï¼‰
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$k=(Get-Content '%ROOT%keys\hub.key' -Raw).Trim(); Start-Process ('http://127.0.0.1:39310/?key=' + $k)"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$k=(Get-Content '%ROOT%keys\hub.key' -Raw).Trim(); Start-Process ('http://127.0.0.1:39310/?key=' + $k)"
 
-echo å·²åœ¨æµè§ˆå™¨ä¸­æ‰“å¼€ï¼šhttp://127.0.0.1:39310/?key=****
+echo ÒÑÔÚä¯ÀÀÆ÷ÖÐ´ò¿ª£ºhttp://127.0.0.1:39310/?key=****
 timeout /t 3 >nul
 endlocal
