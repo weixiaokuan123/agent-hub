@@ -9,7 +9,7 @@
 - **账号总览**：每个平台/区域的登录账号、登录状态、模型数、代理端口运行状态
 - **签到面板**：今天签没签、连签天数、今日积分、今天的随机计划时刻、最近一次结果
 - **一键签到**：单个平台「立即签到」或顶部「全部签到」（幂等，已签的自动跳过）
-- 每 60 秒自动刷新
+- 每 5 分钟自动刷新（标签页隐藏时暂停，切回时立即刷新一次）
 
 **它不接触任何凭据**——只通过各代理已有的回环 HTTP 接口聚合数据。
 
@@ -53,12 +53,51 @@ http://127.0.0.1:39310/?key=<你的hub-key>
 | GET | `/api/overview` | 三平台账号/模型/签到汇总 |
 | GET | `/api/services` | 各代理端口监听状态 |
 | POST | `/api/signin/claim` | 指定平台立即签到（body `{"id":"trae-cn"}`）|
+| GET | `/api/update/check` | 只检查各代理是否有新版（不拉取）|
+| POST | `/api/update/apply` | 检查并快进拉取各代理新版（更新后需重启代理生效）|
+
+## 自动更新
+
+agent-hub 会**代为检查并快进更新**三个代理仓库（workbuddy-proxy / trae-proxy / minimax-proxy）：
+
+- 启动 30 秒后检查一次，之后每 24 小时检查一次
+- 判定依据：各代理 `/healthz` 返回的 `version` ↔ 对应 GitHub 仓库的**最新 tag**（如 `v1.2.0`）
+- 有新版本时执行 `git fetch` + `git merge --ff-only`；本地有未提交改动会跳过，不覆盖任何东西
+- 更新后**不自动重启进程**（避免打断正在进行的对话），只写 `state/update-pending.json` 标记；下次重启生效
+- 用 `OPCODE_NO_AUTO_UPDATE=1` 可完全关闭
+
+> ⚠️ **agent-hub 不能更新自己**（正在运行的进程无法替换自身）。要升级 agent-hub 请手动 `git pull` 后重启。
+>
+> ⚠️ 更新检测**只认 tag**，不认普通 commit。改了代码但没打新 tag，其他机器不会自动跟进。
+
+### 发版流程（每次都做，否则自动更新形同虚设）
+
+在**有改动的仓库**里：
+
+```powershell
+# 1. 递增版本号
+#    编辑 src/version.ts，把 '1.2.0' 改成 '1.3.0'（BUG 修复升 PATCH，新功能升 MINOR）
+
+# 2. 提交
+git add src/version.ts
+git commit -m "chore: 版本 1.2.0 → 1.3.0"
+
+# 3. 打带注释的 tag（必须是 vMAJOR.MINOR.PATCH 格式）
+git tag -a v1.3.0 -m "v1.3.0: 本次更新说明"
+
+# 4. 推送 commit 与 tag
+git push origin main
+git push origin v1.3.0
+```
+
+打完 tag 后，其他机器上的 agent-hub 会在 24 小时内（或重启后 30 秒）自动拉取。
 
 ## 配置
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `AGENT_HUB_PORT` | `39310` | 面板端口 |
+| `OPCODE_NO_AUTO_UPDATE` | 未设置 | 设为任意非空值可关闭自动更新 |
 
 ## 自动签到说明
 
