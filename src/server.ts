@@ -14,7 +14,7 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { Socket } from 'node:net'
 import { dirname, join } from 'node:path'
@@ -103,6 +103,145 @@ async function fetchJson(url: string, key: string, method = 'GET', timeoutMs = 2
     return { ok: res.ok, status: res.status, data }
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/**
+ * WorkBuddy 积分汇总：live 国内(39301) + 多账号(state 目录下 acct-*.key，端口 39320+ i)。
+ *
+ * live 端口的登录态可能与某个 acct 账号是同一个号（例如桌面端切到账号B 后，
+ * live 也变成账号B），若直接累加会把同一账号算两次。因此先查各端口 /status
+ * 取账号标识（account / uin），按标识去重：同一账号只保留一个条目（live 优先）。
+ */
+interface WorkBuddyCreditEntry {
+  label: string
+  port: number
+  /** 账号显示名（用于识别，仅本地面板展示）。 */
+  account?: string
+  total?: number
+  packages?: number
+  error?: string
+  /** 该条目与另一个端口是同一账号，已被合并（不参与求和）。 */
+  duplicateOf?: number
+}
+
+async function workbuddyCredits(): Promise<{ entries: WorkBuddyCreditEntry[]; total: number; note?: string }> {
+  const specs: Array<{ label: string; port: number; keyFile: string }> = [
+    { label: '账号A', port: 39301, keyFile: 'workbuddy-proxy/keys/cn.key' },
+  ]
+  // acct-0, acct-1, ... → 端口 39320, 39321, ...
+  try {
+    const keyDir = join(ROOT, '..', 'workbuddy-proxy', 'keys')
+    const files = await readdir(keyDir)
+    const acct = files
+      .map(f => /^acct-(\d+)\.key$/.exec(f))
+      .filter((m): m is RegExpExecArray => m !== null)
+      .map(m => Number(m[1]))
+      .sort((a, b) => a - b)
+    for (const i of acct) {
+      specs.push({ label: `账号${String.fromCharCode(66 + i)}`, port: 39320 + i, keyFile: `workbuddy-proxy/keys/acct-${i}.key` })
+    }
+  } catch { /* keys 目录缺失时只保留 live */ }
+
+  const raw = await Promise.all(specs.map(async (s): Promise<WorkBuddyCreditEntry> => {
+    try {
+      const key = (await readFile(join(ROOT, '..', s.keyFile), 'utf8')).trim()
+      // 先取账号标识，用于去重
+      let account: string | undefined
+      let uin: string | undefined
+      try {
+        const st = await fetchJson(`http://${HOST}:${s.port}/status`, key)
+        if (st.ok && typeof st.data === 'object' && st.data !== null) {
+          const auth = (st.data as { auth?: { account?: string; uin?: string } }).auth
+          account = auth?.account
+          uin = auth?.uin
+        }
+      } catch { /* 取不到标识就单独计一档 */ }
+      const r = await fetchJson(`http://${HOST}:${s.port}/credits`, key)
+      if (!r.ok || typeof r.data !== 'object' || r.data === null) {
+        return { label: s.label, port: s.port, account, error: r.error ?? `HTTP ${r.status ?? '?'}` }
+      }
+      const d = r.data as { total?: number; packages?: unknown[] }
+      return {
+        label: s.label,
+        port: s.port,
+        account: account ?? uin,
+        total: typeof d.total === 'number' ? d.total : undefined,
+        packages: Array.isArray(d.packages) ? d.packages.length : undefined,
+      }
+    } catch (error) {
+      return { label: s.label, port: s.port, error: error instanceof Error ? error.message : String(error) }
+    }
+  }))
+
+  // 按 account 标识去重：同标识只保留第一个（specs 顺序 live 在前），其余标记为重复。
+  const seen = new Map<string, number>()
+  const entries: WorkBuddyCreditEntry[] = []
+  let deduped = false
+  for (const e of raw) {
+    if (e.account !== undefined && e.account !== '') {
+      if (seen.has(e.account)) {
+        entries.push({ label: e.label, port: e.port, total: e.total, packages: e.packages, duplicateOf: seen.get(e.account) })
+        deduped = true
+        continue
+      }
+      seen.set(e.account, e.port)
+    }
+    entries.push(e)
+  }
+  const total = entries.reduce((sum, e) => sum + (e.duplicateOf === undefined ? (e.total ?? 0) : 0), 0)
+  return {
+    entries,
+    total,
+    ...(deduped ? { note: '同一账号的多个端口已合并，仅计一次' } : {}),
+  }
+}
+
+/**
+ * Trae 额度用量：查询 trae-proxy 的 /credits（上游 /trae/api/v2/pay/ide_user_ent_usage）。
+ * 只取用量摘要：已用 consumed、总额 total、比例 ratio、剩余 remaining。
+ * 上游字段缺失时各项为 undefined，前端显示「—」。
+ */
+interface TraeCreditView {
+  region: string
+  port: number
+  enabled: boolean
+  consumed?: number
+  total?: number
+  remaining?: number
+  ratio?: number
+  error?: string
+}
+
+async function traeCredits(): Promise<TraeCreditView> {
+  const port = 39303
+  const base: TraeCreditView = { region: 'cn', port, enabled: false }
+  try {
+    const key = (await readFile(join(ROOT, '..', 'trae-proxy', 'keys', 'cn.key'), 'utf8')).trim()
+    const r = await fetchJson(`http://${HOST}:${port}/credits`, key)
+    if (!r.ok || typeof r.data !== 'object' || r.data === null) {
+      return { ...base, error: r.error ?? `HTTP ${r.status ?? '?'}` }
+    }
+    const d = r.data as {
+      enabled?: boolean
+      usage?: {
+        usage_summary?: { consumed_amount?: number; total_amount?: number; consumption_ratio?: number }
+      }
+    }
+    const s = d.usage?.usage_summary
+    const consumed = typeof s?.consumed_amount === 'number' ? s.consumed_amount : undefined
+    const total = typeof s?.total_amount === 'number' ? s.total_amount : undefined
+    return {
+      region: 'cn',
+      port,
+      enabled: d.enabled !== false,
+      ...(consumed === undefined ? {} : { consumed }),
+      ...(total === undefined ? {} : { total }),
+      ...(consumed !== undefined && total !== undefined ? { remaining: Math.max(0, total - consumed) } : {}),
+      ...(typeof s?.consumption_ratio === 'number' ? { ratio: s.consumption_ratio } : {}),
+    }
+  } catch (error) {
+    return { ...base, error: error instanceof Error ? error.message : String(error) }
   }
 }
 
@@ -262,6 +401,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   try {
     if (req.method === 'GET' && url === '/api/overview') {
       const data = await overview()
+      res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
+    }
+    if (req.method === 'GET' && url === '/api/workbuddy/credits') {
+      const data = await workbuddyCredits()
+      res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
+    }
+    if (req.method === 'GET' && url === '/api/trae/credits') {
+      const data = await traeCredits()
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
     }
     if (req.method === 'GET' && url === '/api/services') {

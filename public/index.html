@@ -48,12 +48,14 @@
 <header>
   <h1>Agent Hub</h1>
   <span class="tag" id="keyTag">未连接</span>
+  <span class="tag" id="creditTag" title="WorkBuddy 全部账号积分总额">积分 —</span>
   <span class="sp"></span>
   <span class="muted" id="updated"></span>
   <button onclick="refresh()">刷新</button>
   <button class="primary" onclick="claimAll()">全部签到</button>
 </header>
 <main>
+  <div class="grid" id="creditGrid"></div>
   <div class="grid" id="grid"></div>
   <p class="muted footer-note">
     数据来自本机三个代理的回环接口（WorkBuddy 39301/39302、Trae 39303/39304、MiniMax 39305/39306）。
@@ -158,6 +160,49 @@ async function refresh() {
     toast('刷新失败：' + e.message, 'err')
     document.getElementById('keyTag').textContent = '连接失败'
   }
+  refreshCredits()
+}
+
+/** WorkBuddy 全部账号积分：总额徽章 + 明细卡片（独立请求，失败不影响主面板）。 */
+async function refreshCredits() {
+  const tag = document.getElementById('creditTag')
+  const grid = document.getElementById('creditGrid')
+  try {
+    const c = await api('/api/workbuddy/credits')
+    tag.textContent = '积分 ' + (c.total ?? 0)
+    const rows = (c.entries || []).map(e => {
+      const who = e.account ? esc(e.account) + ' · ' : ''
+      const note = e.duplicateOf !== undefined ? ' <span class="muted">(同账号已合并)</span>' : ''
+      const val = e.total === undefined
+        ? '<span class="muted">' + esc(e.error || '不可用') + '</span>'
+        : e.total + ' 分'
+      return `<div class="row"><span>${who}<span class="muted">:${e.port}</span>${note}</span><b>${val}</b></div>`
+    }).join('')
+    grid.innerHTML = `
+      <div class="card">
+        <h2>WorkBuddy 积分 <span class="tag">全部账号 · 去重</span></h2>
+        <div class="row"><span>合计</span><b>${c.total ?? 0} 分</b></div>
+        ${rows}
+        <div class="row"><span class="muted">${c.note ? esc(c.note) + '；' : ''}每次刷新读取实时余额</span></div>
+      </div>`
+  } catch (e) {
+    tag.textContent = '积分 —'
+    grid.innerHTML = ''
+  }
+  // Trae 额度：独立请求，失败不影响 WorkBuddy 卡片
+  try {
+    const t = await api('/api/trae/credits')
+    const num = v => (v === undefined ? '—' : Math.round(v * 100) / 100)
+    const pct = t.ratio === undefined ? '' : ` (${(t.ratio * 100).toFixed(1)}%)`
+    const card = `
+      <div class="card">
+        <h2>Trae 额度 <span class="tag">国内 · :${t.port}</span></h2>
+        <div class="row"><span>剩余</span><b>${num(t.remaining)} 分</b></div>
+        <div class="row"><span>已用 / 总额</span><b>${num(t.consumed)} / ${num(t.total)}${pct}</b></div>
+        <div class="row"><span class="muted">${t.error ? esc(t.error) : '来自 /trae/api/v2/pay/ide_user_ent_usage'}</span></div>
+      </div>`
+    grid.innerHTML += card
+  } catch (e) { /* Trae 额度不可用时静默 */ }
 }
 
 async function claim(id) {
