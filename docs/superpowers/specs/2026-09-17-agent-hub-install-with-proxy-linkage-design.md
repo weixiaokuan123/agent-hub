@@ -10,6 +10,21 @@
 
 `agent-hub/src/server.ts` 通过相对路径 `../workbuddy-proxy/keys/...` 读兄弟仓库的 key 文件，因此兄弟仓库必须与 `agent-hub` 同级放在 `~/.config/opencode/` 下——这是当前架构强约束。
 
+## 前置要求 (Prerequisites)
+
+在运行 `install.cmd` 前必须满足：
+
+| 条件 | 用途 | 脚本能否自动检查 |
+| --- | --- | --- |
+| **Windows 10/11** 或 macOS/Linux | 脚本基于 PowerShell 5.1+，Windows 自带 | 推断（`$IsWindows`），仅提示 |
+| **PowerShell 5.1 或更高** | 运行 `install.ps1` | ✅ 检查 `$PSVersionTable.PSVersion`，< 5.1 报错退出 |
+| **git 在 PATH 上** | `git clone` 三个 proxy 仓库 | ✅ 检查 `git --version`，缺失报错退出 |
+| **能访问 `github.com`** | clone 公开仓库 | ❌ 脚本不验证网络，失败时打印 git 的 stderr |
+| **agent-hub 已 clone 到 `~/.config/opencode/agent-hub`** | install.cmd 在该目录内运行 | ✅ 检查 `src\server.ts` 存在 + 父目录是 `opencode`，否则报错退出 |
+| **Node.js 22.19+ 或 24+** | **运行各 proxy**（不在 `install.cmd` 期间需要） | ❌ 仅在打印后续指引时提示；不阻塞 install |
+
+> 重要：脚本不会替你装 Node.js。若目标机器只有旧 Node.js，会 clone 成功，但 `start.ps1` 启动 proxy 时会失败。
+
 ## 目标
 
 提供 `agent-hub/install.cmd`（双击入口）和 `agent-hub/scripts/install.ps1`，让用户在新机器上一次问完：
@@ -54,9 +69,11 @@ Windows 批处理，调起 `install.ps1`。负责：
 
 主体脚本，参数 `[switch]$WhatIf`。职责：
 
-1. **前置检查**
-   - `git --version` 缺失则报错并退出
-   - 确认当前脚本所在目录是 `agent-hub`（含 `src\server.ts`），否则退出
+1. **前置检查**（任何一个失败立刻退出 1，不进入交互环节）
+   - PowerShell 版本 ≥ 5.1：`$PSVersionTable.PSVersion.Major -ge 5`，否则报错
+   - `git --version` 能解析（不要求 0 退出，只要求命令存在），否则报错
+   - 脚本所在目录的父目录必须名为 `opencode`（大小写不敏感），否则报错（提示正确的 clone 路径）
+   - 当前目录必须含 `src\server.ts`，否则报错（确认这是 agent-hub 仓库）
 2. **交互询问**（PowerShell `Read-Host`，逐项 `[Y/n]`，默认 Y）
    - "是否克隆 workbuddy-proxy? (Y/n)"
    - "是否克隆 trae-proxy? (Y/n)"
@@ -69,7 +86,9 @@ Windows 批处理，调起 `install.ps1`。负责：
    - Abort → 立即退出整个脚本，不再继续后面的 proxy
    - 任一 `git clone` 失败：打印 stderr，继续下一个（不中断整批）
 4. **结果汇总**：打印每个 proxy 的最终状态（新增 / 跳过 / 失败）
-5. **下一步指引**：按克隆/跳过的项目，列出每个 proxy 的"打开 `..\<proxy>\README.md`，按其中的 '安装与启动' 步骤操作"。
+5. **下一步指引**：
+   - 先提醒："确认本机 Node.js 版本（`node --version`）≥ 22.19，否则各 proxy 启动会失败"
+   - 按克隆/跳过的项目，列出每个 proxy 的"打开 `..\<proxy>\README.md`，按其中的 '安装与启动' 步骤操作"
 
 ### `-WhatIf` 模式
 
@@ -88,12 +107,15 @@ Windows 批处理，调起 `install.ps1`。负责：
 
 | 情形 | 处理 |
 | --- | --- |
+| PowerShell < 5.1 | 报错并退出 1（PowerShell 5.1 内置于 Win10+，仅极端情况触发）|
 | 缺 `git` | 报错并退出 1 |
-| 不在 agent-hub 目录 | 报错并退出 1 |
+| 父目录名不是 `opencode` | 报错并退出 1（提示 `agent-hub` 必须 clone 到 `~/.config/opencode/agent-hub`）|
+| 缺 `src\server.ts` | 报错并退出 1（确认脚本在 agent-hub 仓库内）|
 | 目标目录已存在 | 询问 R/S/A |
 | `git clone` 失败（非 0） | 打印 stderr，继续下一个 |
 | 用户 Ctrl+C | `Read-Host` 抛异常时退出（PowerShell 默认会终止）|
 | 代理仓库 URL 改了 | 改脚本顶部 `PROXIES` 数组（`name + url`）即可 |
+| 目标机器 Node.js < 22.19 | **脚本不检测**；在打印后续指引时提醒用户：到各 proxy 仓库跑 `node --version`，旧 Node 需先升级 |
 
 ## 安全/隐私
 
