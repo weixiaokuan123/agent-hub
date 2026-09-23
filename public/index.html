@@ -163,26 +163,32 @@ async function refresh() {
   refreshCredits()
 }
 
-/** WorkBuddy 全部账号积分：总额徽章 + 明细卡片（独立请求，失败不影响主面板）。 */
+/** WorkBuddy 全部账号积分：总额徽章 + 按国内/国际分组明细（独立请求，失败不影响主面板）。 */
 async function refreshCredits() {
   const tag = document.getElementById('creditTag')
   const grid = document.getElementById('creditGrid')
   try {
     const c = await api('/api/workbuddy/credits')
     tag.textContent = '积分 ' + (c.total ?? 0)
-    const rows = (c.entries || []).map(e => {
-      const who = e.account ? esc(e.account) + ' · ' : ''
-      const note = e.duplicateOf !== undefined ? ' <span class="muted">(同账号已合并)</span>' : ''
+    const rowsOf = (entries) => (entries || []).map(e => {
+      const who = e.account ? esc(e.account) : '(未识别账号)'
       const val = e.total === undefined
         ? '<span class="muted">' + esc(e.error || '不可用') + '</span>'
         : e.total + ' 分'
-      return `<div class="row"><span>${who}<span class="muted">:${e.port}</span>${note}</span><b>${val}</b></div>`
+      return `<div class="row"><span>${who} <span class="muted">:${e.port}</span></span><b>${val}</b></div>`
     }).join('')
+    const groups = c.groups || []
+    const sections = groups.map(g => `
+        <div class="row" style="margin-top:10px;padding-top:8px;border-top:1px dashed var(--line)">
+          <span class="k">${esc(g.label)}</span><b>${g.total ?? 0} 分</b>
+        </div>
+        ${rowsOf(g.entries) || '<div class="row muted">无账号</div>'}
+    `).join('')
     grid.innerHTML = `
       <div class="card">
-        <h2>WorkBuddy 积分 <span class="tag">全部账号 · 去重</span></h2>
+        <h2>WorkBuddy 积分 <span class="tag">分区域 · 去重</span></h2>
         <div class="row"><span>合计</span><b>${c.total ?? 0} 分</b></div>
-        ${rows}
+        ${sections || '<div class="row muted">暂无数据</div>'}
         <div class="row"><span class="muted">${c.note ? esc(c.note) + '；' : ''}每次刷新读取实时余额</span></div>
       </div>`
   } catch (e) {

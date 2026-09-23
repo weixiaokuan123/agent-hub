@@ -61,7 +61,7 @@ http://127.0.0.1:39310/?key=<你的hub-key>
 agent-hub 会**代为检查并快进更新**三个代理仓库（workbuddy-proxy / trae-proxy / minimax-proxy）：
 
 - 启动 30 秒后检查一次，之后每 24 小时检查一次
-- 判定依据：各代理 `/healthz` 返回的 `version` ↔ 对应 GitHub 仓库的**最新 tag**（如 `v1.2.0`）
+- 判定依据：各代理 `/healthz` 返回的 `version` ↔ 对应 GitHub 仓库的**最新 tag**（如 `v1.2.1`）
 - 有新版本时执行 `git fetch` + `git merge --ff-only`；本地有未提交改动会跳过，不覆盖任何东西
 - 更新后**不自动重启进程**（避免打断正在进行的对话），只写 `state/update-pending.json` 标记；下次重启生效
 - 用 `OPCODE_NO_AUTO_UPDATE=1` 可完全关闭
@@ -76,18 +76,20 @@ agent-hub 会**代为检查并快进更新**三个代理仓库（workbuddy-proxy
 
 ```powershell
 # 1. 递增版本号
-#    编辑 src/version.ts，把 '1.2.0' 改成 '1.3.0'（BUG 修复升 PATCH，新功能升 MINOR）
+#    编辑 src/version.ts，把 '1.2.1' 改成 '1.2.2'
+#    规则：**每次发版只递增 PATCH（最后一位 +1）**，例如 1.2.1 → 1.2.2。
+#    不发 MINOR / MAJOR，避免版本跳跃导致其他机器的自动更新比对混乱。
 
 # 2. 提交
 git add src/version.ts
-git commit -m "chore: 版本 1.2.0 → 1.3.0"
+git commit -m "chore: 版本 1.2.1 → 1.2.2"
 
 # 3. 打带注释的 tag（必须是 vMAJOR.MINOR.PATCH 格式）
-git tag -a v1.3.0 -m "v1.3.0: 本次更新说明"
+git tag -a v1.2.2 -m "v1.2.2: 本次更新说明"
 
 # 4. 推送 commit 与 tag
 git push origin main
-git push origin v1.3.0
+git push origin v1.2.2
 ```
 
 打完 tag 后，其他机器上的 agent-hub 会在 24 小时内（或重启后 30 秒）自动拉取。

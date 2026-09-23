@@ -110,9 +110,13 @@ async function fetchJson(url: string, key: string, method = 'GET', timeoutMs = 2
  * WorkBuddy 积分汇总：live 国内(39301) + live 国际(39302) + 多账号
  * (keys 目录下 acct-*.key，端口 39320+ i)。缺失的 key 文件自动跳过。
  *
- * live 端口的登录态可能与某个 acct 账号是同一个号（例如桌面端切到账号B 后，
- * live 也变成账号B），若直接累加会把同一账号算两次。因此先查各端口 /status
- * 取账号标识（account / uin），按标识去重：同一账号只保留一个条目（live 优先）。
+ * 两个要点：
+ *  1. **按区域分组**：从各端口 /status 的 `auth.domain` 判断区域
+ *     （www.codebuddy.cn → cn 国内版，www.workbuddy.ai → global 国际版），
+ *     国内与国际分开列出，各自小计，互不混合。
+ *  2. **同账号去重后不再列出**：live 端口与某个 acct 端口可能是同一个号
+ *     （桌面端切号后 live 跟随），按账号标识（account / uin）去重，
+ *     重复项直接丢弃，只保留 live 优先的那一条，不进入返回结果。
  */
 interface WorkBuddyCreditEntry {
   label: string
@@ -122,16 +126,25 @@ interface WorkBuddyCreditEntry {
   total?: number
   packages?: number
   error?: string
-  /** 该条目与另一个端口是同一账号，已被合并（不参与求和）。 */
-  duplicateOf?: number
 }
 
-async function workbuddyCredits(): Promise<{ entries: WorkBuddyCreditEntry[]; total: number; note?: string }> {
+interface WorkBuddyCreditGroup {
+  region: 'cn' | 'global'
+  label: string
+  entries: WorkBuddyCreditEntry[]
+  total: number
+}
+
+async function workbuddyCredits(): Promise<{
+  groups: WorkBuddyCreditGroup[]
+  total: number
+  note?: string
+}> {
   let keyFiles: string[] = []
   try { keyFiles = await readdir(join(ROOT, '..', 'workbuddy-proxy', 'keys')) } catch { /* keys 目录缺失 */ }
   const specs: Array<{ label: string; port: number; keyFile: string }> = []
-  if (keyFiles.includes('cn.key')) specs.push({ label: '国内版', port: 39301, keyFile: 'workbuddy-proxy/keys/cn.key' })
-  if (keyFiles.includes('global.key')) specs.push({ label: '国际版', port: 39302, keyFile: 'workbuddy-proxy/keys/global.key' })
+  if (keyFiles.includes('cn.key')) specs.push({ label: 'live 登录态', port: 39301, keyFile: 'workbuddy-proxy/keys/cn.key' })
+  if (keyFiles.includes('global.key')) specs.push({ label: 'live 登录态', port: 39302, keyFile: 'workbuddy-proxy/keys/global.key' })
   // acct-0, acct-1, ... → 端口 39320, 39321, ...
   const acct = keyFiles
     .map(f => /^acct-(\d+)\.key$/.exec(f))
@@ -139,32 +152,37 @@ async function workbuddyCredits(): Promise<{ entries: WorkBuddyCreditEntry[]; to
     .map(m => Number(m[1]))
     .sort((a, b) => a - b)
   for (const i of acct) {
-    specs.push({ label: `账号${String.fromCharCode(66 + i)}`, port: 39320 + i, keyFile: `workbuddy-proxy/keys/acct-${i}.key` })
+    specs.push({ label: `账号库 #${i}`, port: 39320 + i, keyFile: `workbuddy-proxy/keys/acct-${i}.key` })
   }
 
-  const raw = await Promise.all(specs.map(async (s): Promise<WorkBuddyCreditEntry> => {
+  const raw = await Promise.all(specs.map(async (s): Promise<WorkBuddyCreditEntry & { region?: 'cn' | 'global' }> => {
     try {
       const key = (await readFile(join(ROOT, '..', s.keyFile), 'utf8')).trim()
-      // 先取账号标识，用于去重
+      // 先取账号标识与区域（domain），前者用于去重，后者用于分组
       let account: string | undefined
       let uin: string | undefined
+      let region: 'cn' | 'global' | undefined
       try {
         const st = await fetchJson(`http://${HOST}:${s.port}/status`, key)
         if (st.ok && typeof st.data === 'object' && st.data !== null) {
-          const auth = (st.data as { auth?: { account?: string; uin?: string } }).auth
+          const auth = (st.data as { auth?: { account?: string; uin?: string; domain?: string } }).auth
           account = auth?.account
           uin = auth?.uin
+          const domain = (auth?.domain ?? '').toLowerCase()
+          if (domain.includes('workbuddy.ai')) region = 'global'
+          else if (domain.includes('codebuddy.cn')) region = 'cn'
         }
       } catch { /* 取不到标识就单独计一档 */ }
       const r = await fetchJson(`http://${HOST}:${s.port}/credits`, key)
       if (!r.ok || typeof r.data !== 'object' || r.data === null) {
-        return { label: s.label, port: s.port, account, error: r.error ?? `HTTP ${r.status ?? '?'}` }
+        return { label: s.label, port: s.port, account, region, error: r.error ?? `HTTP ${r.status ?? '?'}` }
       }
       const d = r.data as { total?: number; packages?: unknown[] }
       return {
         label: s.label,
         port: s.port,
         account: account ?? uin,
+        region,
         total: typeof d.total === 'number' ? d.total : undefined,
         packages: Array.isArray(d.packages) ? d.packages.length : undefined,
       }
@@ -173,26 +191,39 @@ async function workbuddyCredits(): Promise<{ entries: WorkBuddyCreditEntry[]; to
     }
   }))
 
-  // 按 account 标识去重：同标识只保留第一个（specs 顺序 live 在前），其余标记为重复。
+  // 按 account 标识去重：同标识只保留第一个（specs 顺序 live 在前），
+  // 其余重复项直接丢弃 —— 已合并的账号不再出现在结果里。
   const seen = new Map<string, number>()
-  const entries: WorkBuddyCreditEntry[] = []
-  let deduped = false
+  const deduped: Array<WorkBuddyCreditEntry & { region?: 'cn' | 'global' }> = []
+  let merged = 0
   for (const e of raw) {
     if (e.account !== undefined && e.account !== '') {
-      if (seen.has(e.account)) {
-        entries.push({ label: e.label, port: e.port, total: e.total, packages: e.packages, duplicateOf: seen.get(e.account) })
-        deduped = true
-        continue
-      }
+      if (seen.has(e.account)) { merged += 1; continue }
       seen.set(e.account, e.port)
     }
-    entries.push(e)
+    deduped.push(e)
   }
-  const total = entries.reduce((sum, e) => sum + (e.duplicateOf === undefined ? (e.total ?? 0) : 0), 0)
+
+  // 按区域分组：cn 在前，global 在后。取不到区域的条目归入 cn（live 国内为主）。
+  const groups: WorkBuddyCreditGroup[] = []
+  for (const region of ['cn', 'global'] as const) {
+    const entries = deduped
+      .filter(e => (region === 'cn' ? e.region !== 'global' : e.region === 'global'))
+      .map(({ region: _r, ...rest }) => rest)
+    if (entries.length === 0) continue
+    groups.push({
+      region,
+      label: region === 'cn' ? '国内版' : '国际版',
+      entries,
+      total: entries.reduce((sum, e) => sum + (e.total ?? 0), 0),
+    })
+  }
+
+  const total = groups.reduce((sum, g) => sum + g.total, 0)
   return {
-    entries,
+    groups,
     total,
-    ...(deduped ? { note: '同一账号的多个端口已合并，仅计一次' } : {}),
+    ...(merged > 0 ? { note: `已合并 ${merged} 个同账号重复端口` } : {}),
   }
 }
 
