@@ -90,11 +90,13 @@ async function readRegionKey(def: RegionDef): Promise<string | null> {
   }
 }
 
-async function fetchJson(url: string, key: string, method = 'GET', timeoutMs = 20000): Promise<{ ok: boolean; status?: number; data?: unknown; error?: string }> {
+async function fetchJson(url: string, key?: string, method = 'GET', timeoutMs = 20000): Promise<{ ok: boolean; status?: number; data?: unknown; error?: string }> {
   try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (key !== undefined && key !== '') headers['Authorization'] = `Bearer ${key}`
     const res = await fetch(url, {
       method,
-      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      headers,
       signal: AbortSignal.timeout(timeoutMs),
     })
     const text = await res.text()
@@ -255,6 +257,124 @@ async function traeCredits(): Promise<TraeCreditView> {
   }
 }
 
+/**
+ * Qoder 额度与签到：查询 qoder-proxy 的 /status（只读桌面端登录态，无需 bearer）。
+ *
+ * 与 WorkBuddy/Trae 不同，Qoder 的额度是**单账号 per 区域**（桌面端同一区域只有
+ * 一份登录态），因此这里不做账号池展开，直接映射 region → 一行摘要。
+ */
+interface QoderRegionView {
+  region: 'cn' | 'global'
+  label: string
+  port: number
+  loggedIn: boolean
+  account?: string
+  planName?: string
+  total?: number
+  used?: number
+  remaining?: number
+  unit?: string
+  todayCheckedIn?: boolean
+  claimable?: boolean
+  claimableAmount?: number
+  hasBenefitCampaign?: boolean
+  dailyCredit?: number
+  streakDays?: number
+  tokenExpiresIn?: string
+  error?: string
+}
+
+async function qoderStatus(): Promise<{ regions: QoderRegionView[]; total: number; note?: string }> {
+  const port = 39320
+  const labels: Array<{ region: 'cn' | 'global'; label: string }> = [
+    { region: 'cn', label: '国内版' },
+    { region: 'global', label: '国际版' },
+  ]
+  const base = (region: 'cn' | 'global', label: string): QoderRegionView => ({
+    region, label, port, loggedIn: false,
+  })
+
+  try {
+    const r = await fetchJson(`http://${HOST}:${port}/status`)
+    if (!r.ok || typeof r.data !== 'object' || r.data === null) {
+      return {
+        regions: labels.map(l => ({ ...base(l.region, l.label), error: r.error ?? `HTTP ${r.status ?? '?'}` })),
+        total: 0,
+        note: `qoder-proxy(${port}) 读取失败：${r.error ?? `HTTP ${r.status ?? '?'}`}`,
+      }
+    }
+    const payload = r.data as { regions?: unknown }
+    const list = Array.isArray(payload.regions) ? payload.regions : []
+    const out: QoderRegionView[] = []
+    for (const l of labels) {
+      const hit = list.find(x => typeof x === 'object' && x !== null && (x as { region?: unknown }).region === l.region)
+      if (hit === undefined) {
+        out.push({ ...base(l.region, l.label), error: '响应中缺少该区域' })
+        continue
+      }
+      out.push(mapQoderRegion(hit as Record<string, unknown>, l.region, l.label, port))
+    }
+    const total = out.reduce((sum, x) => sum + (x.remaining ?? 0), 0)
+    return { regions: out, total }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    return {
+      regions: labels.map(l => ({ ...base(l.region, l.label), error: msg })),
+      total: 0,
+      note: `qoder-proxy(${port}) 不可达：${msg}`,
+    }
+  }
+}
+
+/** 把 qoder-proxy 的单区域 status 映射成面板视图（纯函数，便于测试）。 */
+export function mapQoderRegion(
+  raw: Record<string, unknown>,
+  region: 'cn' | 'global',
+  label: string,
+  port: number,
+): QoderRegionView {
+  const view: QoderRegionView = { region, label, port, loggedIn: raw['loggedIn'] === true }
+  if (raw['loggedIn'] !== true) {
+    const message = typeof raw['message'] === 'string' ? raw['message'] : undefined
+    view.error = message ?? (typeof raw['error'] === 'string' ? raw['error'] : '未登录')
+    return view
+  }
+
+  const email = raw['email']
+  const phone = raw['phone']
+  const name = raw['name']
+  if (typeof email === 'string' && email !== '') view.account = email
+  else if (typeof phone === 'string' && phone !== '') view.account = phone
+  else if (typeof name === 'string' && name !== '') view.account = name
+
+  const plan = raw['plan'] as { planTierName?: unknown; userType?: unknown } | undefined
+  const planName = typeof plan?.planTierName === 'string' ? plan.planTierName
+    : typeof plan?.userType === 'string' ? plan.userType : undefined
+  if (planName !== undefined) view.planName = planName
+
+  const usage = raw['usage'] as {
+    total?: unknown; used?: unknown; remaining?: unknown; unit?: unknown
+  } | undefined
+  if (typeof usage?.total === 'number') view.total = usage.total
+  if (typeof usage?.used === 'number') view.used = usage.used
+  if (typeof usage?.remaining === 'number') view.remaining = usage.remaining
+  if (typeof usage?.unit === 'string') view.unit = usage.unit
+
+  const signin = raw['signin'] as {
+    todayCheckedIn?: unknown; claimable?: unknown; claimableAmount?: unknown
+    hasBenefitCampaign?: unknown; dailyCredit?: unknown; streakDays?: unknown
+  } | undefined
+  if (typeof signin?.todayCheckedIn === 'boolean') view.todayCheckedIn = signin.todayCheckedIn
+  if (typeof signin?.claimable === 'boolean') view.claimable = signin.claimable
+  if (typeof signin?.claimableAmount === 'number') view.claimableAmount = signin.claimableAmount
+  if (typeof signin?.hasBenefitCampaign === 'boolean') view.hasBenefitCampaign = signin.hasBenefitCampaign
+  if (typeof signin?.dailyCredit === 'number') view.dailyCredit = signin.dailyCredit
+  if (typeof signin?.streakDays === 'number') view.streakDays = signin.streakDays
+
+  if (typeof raw['tokenExpiresIn'] === 'string') view.tokenExpiresIn = raw['tokenExpiresIn']
+  return view
+}
+
 /** 探测某端口是否有服务监听（TCP 连接探测）。 */
 async function probePort(port: number): Promise<boolean> {
   const net = await import('node:net')
@@ -361,6 +481,17 @@ async function claim(id: string): Promise<{ ok: boolean; status?: number; data?:
   return { ok: res.ok, status: res.status, data: res.data, error: res.error }
 }
 
+/**
+ * Qoder 签到：调 qoder-proxy 的 POST /signin/claim?region=…
+ *
+ * 与其它代理不同，Qoder 每个区域只有一份登录态、且管理接口不带 bearer，
+ * 因此这里不走 REGIONS/claim()，单独实现。
+ */
+async function qoderClaim(region: 'cn' | 'global'): Promise<{ ok: boolean; status?: number; data?: unknown; error?: string }> {
+  const res = await fetchJson(`http://${HOST}:39320/signin/claim?region=${region}`, undefined, 'POST', 40000)
+  return { ok: res.ok, status: res.status, data: res.data, error: res.error }
+}
+
 function hostIsLoopback(host: string | undefined): boolean {
   if (host === undefined || host.trim() === '') return false
   let h = host.trim().toLowerCase()
@@ -425,6 +556,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const data = await traeCredits()
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
     }
+    if (req.method === 'GET' && url === '/api/qoder/status') {
+      const data = await qoderStatus()
+      res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
+    }
     if (req.method === 'GET' && url === '/api/services') {
       const settled = await Promise.allSettled(REGIONS.map(async d => ({ id: d.id, port: d.port, running: await probePort(d.port) })))
       const svc = settled.map(r => r.status === 'fulfilled'
@@ -437,7 +572,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       let id = ''
       try { id = (JSON.parse(body) as { id?: string }).id ?? '' } catch { /* */ }
       if (!id) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing id' })); return }
-      const result = await claim(id)
+      // Qoder 的签到目标用 `qoder:cn` / `qoder:global` 前缀区分（单账号 per 区域）。
+      const qoder = /^qoder:(cn|global)$/.exec(id)
+      const result = qoder !== null ? await qoderClaim(qoder[1] as 'cn' | 'global') : await claim(id)
       res.writeHead(result.ok ? 200 : 502, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(result)); return
     }
