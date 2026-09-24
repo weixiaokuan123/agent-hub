@@ -17,7 +17,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { Socket } from 'node:net'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AGENT_HUB_VERSION } from './version.ts'
 
@@ -135,6 +135,30 @@ interface WorkBuddyCreditGroup {
   total: number
 }
 
+/**
+ * 从 `/status` 响应里解析出池内账号的积分条目。
+ *
+ * 抽成纯函数以便测试：上游字段可能缺失/异常，这里逐条降级 ——
+ * 某账号没有积分就带上 creditsError，而不是整块丢掉。
+ */
+export function parsePoolEntries(
+  statusData: unknown,
+  port: number,
+): WorkBuddyCreditEntry[] {
+  const data = (typeof statusData === 'object' && statusData !== null ? statusData : {}) as {
+    pool?: { entries?: Array<{ label?: string; credits?: number; packages?: number; creditsError?: string }> }
+  }
+  const raw = data.pool?.entries
+  if (!Array.isArray(raw)) return []
+  return raw.map((e): WorkBuddyCreditEntry => {
+    const label = typeof e.label === 'string' && e.label !== '' ? e.label : `端口 ${port}`
+    if (typeof e.credits === 'number') {
+      return { label, port, account: label, total: e.credits, packages: e.packages }
+    }
+    return { label, port, account: label, error: e.creditsError ?? '积分未知' }
+  })
+}
+
 async function workbuddyCredits(): Promise<{
   groups: WorkBuddyCreditGroup[]
   total: number
@@ -142,89 +166,45 @@ async function workbuddyCredits(): Promise<{
 }> {
   let keyFiles: string[] = []
   try { keyFiles = await readdir(join(ROOT, '..', 'workbuddy-proxy', 'keys')) } catch { /* keys 目录缺失 */ }
-  const specs: Array<{ label: string; port: number; keyFile: string }> = []
-  if (keyFiles.includes('cn.key')) specs.push({ label: 'live 登录态', port: 39301, keyFile: 'workbuddy-proxy/keys/cn.key' })
-  if (keyFiles.includes('global.key')) specs.push({ label: 'live 登录态', port: 39302, keyFile: 'workbuddy-proxy/keys/global.key' })
-  // acct-0, acct-1, ... → 端口 39320, 39321, ...
-  const acct = keyFiles
-    .map(f => /^acct-(\d+)\.key$/.exec(f))
-    .filter((m): m is RegExpExecArray => m !== null)
-    .map(m => Number(m[1]))
-    .sort((a, b) => a - b)
-  for (const i of acct) {
-    specs.push({ label: `账号库 #${i}`, port: 39320 + i, keyFile: `workbuddy-proxy/keys/acct-${i}.key` })
-  }
 
-  const raw = await Promise.all(specs.map(async (s): Promise<WorkBuddyCreditEntry & { region?: 'cn' | 'global' }> => {
-    try {
-      const key = (await readFile(join(ROOT, '..', s.keyFile), 'utf8')).trim()
-      // 先取账号标识与区域（domain），前者用于去重，后者用于分组
-      let account: string | undefined
-      let uin: string | undefined
-      let region: 'cn' | 'global' | undefined
-      try {
-        const st = await fetchJson(`http://${HOST}:${s.port}/status`, key)
-        if (st.ok && typeof st.data === 'object' && st.data !== null) {
-          const auth = (st.data as { auth?: { account?: string; uin?: string; domain?: string } }).auth
-          account = auth?.account
-          uin = auth?.uin
-          const domain = (auth?.domain ?? '').toLowerCase()
-          if (domain.includes('workbuddy.ai')) region = 'global'
-          else if (domain.includes('codebuddy.cn')) region = 'cn'
-        }
-      } catch { /* 取不到标识就单独计一档 */ }
-      const r = await fetchJson(`http://${HOST}:${s.port}/credits`, key)
-      if (!r.ok || typeof r.data !== 'object' || r.data === null) {
-        return { label: s.label, port: s.port, account, region, error: r.error ?? `HTTP ${r.status ?? '?'}` }
-      }
-      const d = r.data as { total?: number; packages?: unknown[] }
-      return {
-        label: s.label,
-        port: s.port,
-        account: account ?? uin,
-        region,
-        total: typeof d.total === 'number' ? d.total : undefined,
-        packages: Array.isArray(d.packages) ? d.packages.length : undefined,
-      }
-    } catch (error) {
-      return { label: s.label, port: s.port, error: error instanceof Error ? error.message : String(error) }
+  // 池化模型：只连两个入口（cn 39301 / global 39302），
+  // 池内账号由 /status 的 pool.entries 展开（每个条目自带积分）。
+  // 不再扫描 acct-N.key —— 那些独立端口已默认关闭。
+  const ports: Array<{ region: 'cn' | 'global'; label: string; port: number; keyFile: string }> = []
+  if (keyFiles.includes('cn.key')) ports.push({ region: 'cn', label: '国内版', port: 39301, keyFile: 'workbuddy-proxy/keys/cn.key' })
+  if (keyFiles.includes('global.key')) ports.push({ region: 'global', label: '国际版', port: 39302, keyFile: 'workbuddy-proxy/keys/global.key' })
+
+  const groupMap = new Map<'cn' | 'global', WorkBuddyCreditGroup>()
+  const noteParts: string[] = []
+
+  // allSettled：任一入口失败不拖累整个面板 500。
+  const settled = await Promise.allSettled(ports.map(async (p): Promise<WorkBuddyCreditGroup> => {
+    const key = (await readFile(join(ROOT, '..', p.keyFile), 'utf8')).trim()
+    const st = await fetchJson(`http://${HOST}:${p.port}/status`, key)
+    if (!st.ok || typeof st.data !== 'object' || st.data === null) {
+      throw new Error(st.error ?? `HTTP ${st.status ?? '?'}`)
     }
+    const entries = parsePoolEntries(st.data, p.port)
+    const total = entries.reduce((sum, e) => sum + (e.total ?? 0), 0)
+    return { region: p.region, label: p.label, entries, total }
   }))
 
-  // 按 account 标识去重：同标识只保留第一个（specs 顺序 live 在前），
-  // 其余重复项直接丢弃 —— 已合并的账号不再出现在结果里。
-  const seen = new Map<string, number>()
-  const deduped: Array<WorkBuddyCreditEntry & { region?: 'cn' | 'global' }> = []
-  let merged = 0
-  for (const e of raw) {
-    if (e.account !== undefined && e.account !== '') {
-      if (seen.has(e.account)) { merged += 1; continue }
-      seen.set(e.account, e.port)
+  for (let i = 0; i < settled.length; i++) {
+    const s = settled[i]
+    const p = ports[i] as { region: 'cn' | 'global'; label: string; port: number }
+    if (s?.status === 'fulfilled') {
+      groupMap.set(s.value.region, s.value)
+    } else {
+      const reason = s?.status === 'rejected' ? (s.reason instanceof Error ? s.reason.message : String(s.reason)) : '未知错误'
+      noteParts.push(`${p.label}(${p.port}) 读取失败：${reason}`)
+      groupMap.set(p.region, { region: p.region, label: p.label, entries: [], total: 0 })
     }
-    deduped.push(e)
   }
 
-  // 按区域分组：cn 在前，global 在后。取不到区域的条目归入 cn（live 国内为主）。
-  const groups: WorkBuddyCreditGroup[] = []
-  for (const region of ['cn', 'global'] as const) {
-    const entries = deduped
-      .filter(e => (region === 'cn' ? e.region !== 'global' : e.region === 'global'))
-      .map(({ region: _r, ...rest }) => rest)
-    if (entries.length === 0) continue
-    groups.push({
-      region,
-      label: region === 'cn' ? '国内版' : '国际版',
-      entries,
-      total: entries.reduce((sum, e) => sum + (e.total ?? 0), 0),
-    })
-  }
-
+  const order: Array<'cn' | 'global'> = ['cn', 'global']
+  const groups = order.map(r => groupMap.get(r)).filter((g): g is WorkBuddyCreditGroup => g !== undefined)
   const total = groups.reduce((sum, g) => sum + g.total, 0)
-  return {
-    groups,
-    total,
-    ...(merged > 0 ? { note: `已合并 ${merged} 个同账号重复端口` } : {}),
-  }
+  return { groups, total, note: noteParts.length > 0 ? noteParts.join('；') : undefined }
 }
 
 /**
@@ -342,7 +322,8 @@ async function checkUpdates(force: boolean): Promise<unknown> {
 }
 
 async function overview(): Promise<unknown> {
-  const items = await Promise.all(REGIONS.map(async (def) => {
+  // allSettled 而非 all：任一区故障不能拖累整个面板 500（每 5 分钟刷新一次）。
+  const settled = await Promise.allSettled(REGIONS.map(async (def) => {
     const key = await readRegionKey(def)
     const running = await probePort(def.port)
     if (!running) {
@@ -365,6 +346,9 @@ async function overview(): Promise<unknown> {
       signin,
     }
   }))
+  const items = settled.map(r => r.status === 'fulfilled'
+    ? r.value
+    : { error: r.reason instanceof Error ? r.reason.message : String(r.reason) })
   return { regions: items, at: Date.now() }
 }
 
@@ -442,7 +426,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
     }
     if (req.method === 'GET' && url === '/api/services') {
-      const svc = await Promise.all(REGIONS.map(async d => ({ id: d.id, port: d.port, running: await probePort(d.port) })))
+      const settled = await Promise.allSettled(REGIONS.map(async d => ({ id: d.id, port: d.port, running: await probePort(d.port) })))
+      const svc = settled.map(r => r.status === 'fulfilled'
+        ? r.value
+        : { id: '?', port: 0, running: false, error: r.reason instanceof Error ? r.reason.message : String(r.reason) })
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ services: svc })); return
     }
     if (req.method === 'POST' && url.startsWith('/api/signin/claim')) {
@@ -505,4 +492,9 @@ async function main(): Promise<void> {
   process.on('SIGTERM', shutdown)
 }
 
-main().catch((error: unknown) => { log('error', 'agent-hub 启动失败：', error); process.exit(1) })
+// 仅在被直接运行时启动服务；被测试 import 时不应占用端口。
+const invokedDirectly = process.argv[1] !== undefined
+  && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+if (invokedDirectly) {
+  main().catch((error: unknown) => { log('error', 'agent-hub 启动失败：', error); process.exit(1) })
+}
