@@ -1,4 +1,4 @@
-# Stop agent-hub. No WMI, no Get-NetTCPConnection (slow); use netstat -ano.
+﻿# Stop agent-hub. No WMI, no Get-NetTCPConnection (slow); use netstat -ano.
 $ErrorActionPreference = 'Continue'
 $Root    = Split-Path -Parent $PSScriptRoot
 $PidFile = Join-Path $Root 'logs\hub.pid'
