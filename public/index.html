@@ -95,7 +95,7 @@ async function api(path, method = 'GET', body) {
   return data
 }
 
-function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])) }
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])) }
 
 function authOf(r) {
   const a = r.auth || {}
@@ -131,7 +131,7 @@ function signinHtml(r) {
       ${s.lastResult ? `<div class="row"><span class="k">最近结果</span><span class="muted">${esc(s.lastResult)}</span></div>` : ''}
       <div class="row" style="margin-top:8px">
         <span></span>
-        <button onclick="claim('${r.id}')" ${checkedIn ? 'disabled' : ''}>立即签到</button>
+        <button onclick="claim('${esc(r.id)}')" ${checkedIn ? 'disabled' : ''}>立即签到</button>
       </div>
     </div>`
 }
@@ -150,6 +150,8 @@ function card(r) {
 }
 
 let refreshInFlight = false
+/** 上次主面板刷新成功的时间戳；用于切回标签页时的节流判断。 */
+let lastRefreshAt = 0
 
 async function refresh() {
   if (!HUB_KEY) { document.getElementById('keyTag').textContent = '缺少 key'; return }
@@ -162,6 +164,7 @@ async function refresh() {
     document.getElementById('keyTag').textContent = '已连接'
     document.getElementById('grid').innerHTML = data.regions.map(card).join('')
     document.getElementById('updated').textContent = '更新于 ' + new Date(data.at).toLocaleTimeString()
+    lastRefreshAt = Date.now()
   } catch (e) {
     toast('刷新失败：' + e.message, 'err')
     document.getElementById('keyTag').textContent = '连接失败'
@@ -210,14 +213,14 @@ async function refreshCredits() {
     const t = await api('/api/trae/credits')
     const num = v => (v === undefined ? '—' : Math.round(v * 100) / 100)
     const pct = t.ratio === undefined ? '' : ` (${(t.ratio * 100).toFixed(1)}%)`
-    const card = `
+    const traeCard = `
       <div class="card">
         <h2>Trae 额度 <span class="tag">国内 · :${t.port}</span></h2>
         <div class="row"><span>剩余</span><b>${num(t.remaining)} 分</b></div>
         <div class="row"><span>已用 / 总额</span><b>${num(t.consumed)} / ${num(t.total)}${pct}</b></div>
         <div class="row"><span class="muted">${t.error ? esc(t.error) : '来自 /trae/api/v2/pay/ide_user_ent_usage'}</span></div>
       </div>`
-    grid.innerHTML += card
+    grid.innerHTML += traeCard
   } catch (e) { /* Trae 额度不可用时静默 */ }
 }
 
@@ -230,24 +233,6 @@ async function claim(id) {
   } catch (e) { toast(id + ' 签到失败：' + e.message, 'err') }
 }
 
-/** 立即签到单个平台（data-claim 按钮）。 */
-async function claimById(btn) {
-  const id = btn.dataset.claim
-  const pretty = btn.dataset.pretty || id
-  btn.disabled = true
-  try {
-    const r = await api('/api/signin/claim', 'POST', { id })
-    // 代理返回 { entry:{result} }
-    const msg = r.entry?.result || r.results?.[0]?.message || '已处理'
-    toast(pretty + '：' + msg, 'ok')
-  } catch (e) {
-    toast(pretty + ' 签到失败：' + e.message, 'err')
-  } finally {
-    btn.disabled = false
-    refresh()
-  }
-}
-
 async function claimAll() {
   try {
     const data = await api('/api/overview')
@@ -258,9 +243,10 @@ async function claimAll() {
   } catch (e) { toast('批量签到失败：' + e.message, 'err') }
 }
 
-// 自动刷新：5 分钟一次；标签页不可见时暂停，切回时立即刷新一次。
-// 面板每次刷新都会向 WorkBuddy/Trae 上游查询余额，降低频率可避免频繁调用。
-const REFRESH_MS = 5 * 60 * 1000
+// 自动刷新：15 分钟一次；标签页不可见时暂停，切回时若距上次成功刷新不足
+// 60 秒则跳过。面板每次刷新都会向 WorkBuddy/Trae 上游查询余额，降低频率可避免频繁调用。
+const REFRESH_MS = 15 * 60 * 1000
+const VISIBILITY_MIN_GAP_MS = 60 * 1000
 let refreshTimer = null
 
 function startAutoRefresh() {
@@ -273,8 +259,9 @@ function stopAutoRefresh() {
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { stopAutoRefresh() }
-  else { refresh(); startAutoRefresh() }
+  if (document.hidden) { stopAutoRefresh(); return }
+  startAutoRefresh()
+  if (Date.now() - lastRefreshAt >= VISIBILITY_MIN_GAP_MS) refresh()
 })
 
 refresh()
