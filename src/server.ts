@@ -351,6 +351,39 @@ async function checkUpdates(force: boolean): Promise<unknown> {
   return { mode: 'update', results }
 }
 
+/* ------------------------------------------------------------------ *
+ * 高危端点：POST /api/update/apply
+ *
+ * 这个端点会在磁盘上执行 `git fetch` + `git merge --ff-only`，是面板里唯一
+ * 有副作用的写操作，因此额外加三道闸：
+ *   1. 二次确认：请求体必须是 {"confirm":"apply"}，防误触/防 CSRF 式盲打；
+ *   2. 并发锁：git 操作不能并行（会互抢 .git/index.lock），进行中一律 409；
+ *   3. 审计日志：每次调用（**含被拒**）都留一行，便于事后追溯是谁触发的。
+ *
+ * 注意：每日定时自动更新**不经过** HTTP 端点（main() 直接调 checkUpdates(true)），
+ * 所以这里的二次确认只约束外部调用，不影响自动更新。以后若要改定时器，
+ * 不要去给它加 confirm —— 它是进程内的可信调用方。
+ * ------------------------------------------------------------------ */
+
+/** 是否已有一次 apply 在执行。 */
+let applyInFlight = false
+
+/** 审计日志：时间、来源、确认结果、执行结果。不落单独文件（避免新增写盘）。 */
+function auditApply(req: IncomingMessage, confirmed: boolean, outcome: string): void {
+  const ip = req.socket.remoteAddress ?? '?'
+  log('info', `[audit] /api/update/apply from=${ip} confirm=${confirmed ? 'ok' : 'rejected'} result=${outcome}`)
+}
+
+/** 从请求体里解析确认字段；容忍空体与非法 JSON。 */
+function parseConfirm(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { confirm?: unknown }
+    return typeof parsed.confirm === 'string' ? parsed.confirm : ''
+  } catch {
+    return ''
+  }
+}
+
 async function overview(): Promise<unknown> {
   // allSettled 而非 all：任一区故障不能拖累整个面板 500（前端每 15 分钟刷新一次）。
   const settled = await Promise.allSettled(REGIONS.map(async (def) => {
@@ -443,6 +476,54 @@ function authed(req: IncomingMessage): boolean {
 /** index.html 内存缓存：面板是静态资源，没必要每次请求都读盘（改完重启即可生效）。 */
 let indexHtmlCache: string | null = null
 
+/**
+ * 统一响应安全头。
+ *
+ * 面板只在本机回环访问，但仍要挡住两类真实风险：
+ *  1. **key 经 URL 传递**：首次访问是 `/?key=…`，若被外链或跨站请求带走，
+ *     浏览器的 Referer 会把 key 一起送出去 —— 故必须 `Referrer-Policy: no-referrer`。
+ *  2. **点击劫持 / 外链注入**：`frame-ancestors 'none'` + `X-Frame-Options: DENY`，
+ *     以及对内联外的资源一律 `default-src 'none'`。
+ *
+ * 面板是单文件、内联 script/style，所以这两个指令只能放 'unsafe-inline'（其它全关）。
+ * `connect-src 'self'` 保证内联脚本只能访问本面板自身的 API，不能外发数据。
+ */
+const SECURITY_HEADERS: Readonly<Record<string, string>> = {
+  'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'no-referrer',
+  'X-Frame-Options': 'DENY',
+  'Cross-Origin-Opener-Policy': 'same-origin',
+  'Cross-Origin-Resource-Policy': 'same-origin',
+  // 面板与 API 都含账号/积分信息，不该进任何缓存（含浏览器前进后退缓存）
+  'Cache-Control': 'no-store',
+}
+
+/**
+ * 包一层写入器，保证**所有**出口都带上安全头。
+ *
+ * 之所以不在每个 writeHead 里重复：面板分支多、且有多处提前 return，
+ * 逐个写迟早会漏。这里把 res.writeHead 换掉一次即可。
+ */
+function applySecurityHeaders(res: ServerResponse): void {
+  const originalWriteHead = res.writeHead.bind(res)
+  // 重载签名较多，统一按「先合并安全头、再走原生实现」处理。
+  res.writeHead = ((...args: unknown[]) => {
+    const first = args[0]
+    if (typeof first === 'object' && first !== null) {
+      args[0] = { ...SECURITY_HEADERS, ...(first as Record<string, string>) }
+    } else if (typeof first === 'number') {
+      const headers = args[1]
+      if (typeof headers === 'object' && headers !== null) {
+        args[1] = { ...SECURITY_HEADERS, ...(headers as Record<string, string>) }
+      } else {
+        args.splice(1, 0, { ...SECURITY_HEADERS })
+      }
+    }
+    return (originalWriteHead as (...a: unknown[]) => ServerResponse)(...args)
+  }) as ServerResponse['writeHead']
+}
+
 async function serveIndex(res: ServerResponse): Promise<void> {
   try {
     if (indexHtmlCache === null) indexHtmlCache = await readFile(join(PUBLIC_DIR, 'index.html'), 'utf8')
@@ -454,6 +535,7 @@ async function serveIndex(res: ServerResponse): Promise<void> {
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  applySecurityHeaders(res)
   const url = (req.url ?? '/').split('?')[0] ?? '/'
   if (!hostIsLoopback(req.headers.host)) { res.writeHead(403); res.end('禁止访问'); return }
   if (!originIsLoopback(req.headers.origin)) { res.writeHead(403); res.end('禁止访问'); return }
@@ -506,8 +588,31 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
     }
     if (req.method === 'POST' && url === '/api/update/apply') {
-      const data = await checkUpdates(true)
-      res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
+      const body = await readBody(req)
+      if (parseConfirm(body) !== 'apply') {
+        auditApply(req, false, 'bad-confirm')
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: '缺少二次确认：请求体需为 {"confirm":"apply"}' }))
+        return
+      }
+      if (applyInFlight) {
+        auditApply(req, true, 'busy')
+        res.writeHead(409, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: '已有一次更新正在执行，请稍后重试' }))
+        return
+      }
+      applyInFlight = true
+      try {
+        const data = await checkUpdates(true)
+        const results = (data as { results?: Array<{ name: string; state: string; latest: string }> }).results ?? []
+        auditApply(req, true, results.map(r => `${r.name}=${r.state}@${r.latest}`).join(',') || 'no-repos')
+        res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
+      } catch (error) {
+        auditApply(req, true, `error:${error instanceof Error ? error.message : String(error)}`)
+        throw error
+      } finally {
+        applyInFlight = false
+      }
     }
     res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: '未找到' }))
   } catch (error) {
