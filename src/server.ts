@@ -385,11 +385,14 @@ function authed(req: IncomingMessage): boolean {
   return a.length === b.length && timingSafeEqual(a, b)
 }
 
+/** index.html 内存缓存：面板是静态资源，没必要每次请求都读盘（改完重启即可生效）。 */
+let indexHtmlCache: string | null = null
+
 async function serveIndex(res: ServerResponse): Promise<void> {
   try {
-    const html = await readFile(join(PUBLIC_DIR, 'index.html'), 'utf8')
+    if (indexHtmlCache === null) indexHtmlCache = await readFile(join(PUBLIC_DIR, 'index.html'), 'utf8')
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(html)
+    res.end(indexHtmlCache)
   } catch {
     res.writeHead(500); res.end('index.html missing')
   }
@@ -479,7 +482,8 @@ async function main(): Promise<void> {
   })
 
   log('info', `agent-hub 已监听 http://${HOST}:${PORT}`)
-  log('info', `首次访问请带上 key：http://${HOST}:${PORT}/?key=${HUB_KEY}`)
+  // 完整 key 只落在 keys/hub.key（0600），不进日志——日志会被追加保存很久。
+  log('info', `首次访问请带上 key（见 keys/hub.key）：http://${HOST}:${PORT}/?key=${HUB_KEY.slice(0, 6)}…`)
 
   // 每日自动检查更新：启动 30 秒后查一次，之后每 24 小时一次。
   // 只做 git 快进（ff-only），有更新会写 state/update-pending.json，重启代理后生效。
