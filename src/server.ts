@@ -82,11 +82,38 @@ async function loadOrCreateHubKey(): Promise<string> {
   return key
 }
 
-async function readRegionKey(def: RegionDef): Promise<string | null> {
+/**
+ * 区域 key 在进程运行期内不变，读到一次后驻留内存。
+ * 读取失败（尤其 ENOENT = 代理还没生成 key）**不写入缓存**，
+ * 否则代理稍后启动时这里仍会一直返回 null。
+ */
+const regionKeyCache = new Map<string, string>()
+
+async function readRegionKey(keyName: string): Promise<string | null> {
+  const cached = regionKeyCache.get(keyName)
+  if (cached !== undefined) return cached
   try {
-    return (await readFile(join(ROOT, '..', def.keyName), 'utf8')).trim() || null
+    const value = (await readFile(join(ROOT, '..', keyName), 'utf8')).trim()
+    if (value === '') return null
+    regionKeyCache.set(keyName, value)
+    return value
   } catch {
     return null
+  }
+}
+
+/** key 目录清单同样运行期不变；目录缺失（ENOENT，代理还没起来）不缓存。 */
+const keyDirCache = new Map<string, string[]>()
+
+async function readKeyDir(dirName: string): Promise<string[]> {
+  const cached = keyDirCache.get(dirName)
+  if (cached !== undefined) return cached
+  try {
+    const names = await readdir(join(ROOT, '..', dirName))
+    keyDirCache.set(dirName, names)
+    return names
+  } catch {
+    return []
   }
 }
 
@@ -101,7 +128,7 @@ async function fetchJson(url: string, key?: string, method = 'GET', timeoutMs = 
     })
     const text = await res.text()
     let data: unknown = text
-    try { data = JSON.parse(text) } catch { /* keep text */ }
+    try { data = JSON.parse(text) } catch { /* 保留原文 */ }
     return { ok: res.ok, status: res.status, data }
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) }
@@ -166,8 +193,7 @@ async function workbuddyCredits(): Promise<{
   total: number
   note?: string
 }> {
-  let keyFiles: string[] = []
-  try { keyFiles = await readdir(join(ROOT, '..', 'workbuddy-proxy', 'keys')) } catch { /* keys 目录缺失 */ }
+  const keyFiles = await readKeyDir('workbuddy-proxy/keys')
 
   // 池化模型：只连两个入口（cn 39301 / global 39302），
   // 池内账号由 /status 的 pool.entries 展开（每个条目自带积分）。
@@ -181,7 +207,8 @@ async function workbuddyCredits(): Promise<{
 
   // allSettled：任一入口失败不拖累整个面板 500。
   const settled = await Promise.allSettled(ports.map(async (p): Promise<WorkBuddyCreditGroup> => {
-    const key = (await readFile(join(ROOT, '..', p.keyFile), 'utf8')).trim()
+    const key = await readRegionKey(p.keyFile)
+    if (key === null) throw new Error(`缺少 key：${p.keyFile}`)
     const st = await fetchJson(`http://${HOST}:${p.port}/status`, key)
     if (!st.ok || typeof st.data !== 'object' || st.data === null) {
       throw new Error(st.error ?? `HTTP ${st.status ?? '?'}`)
@@ -229,7 +256,8 @@ async function traeCredits(): Promise<TraeCreditView> {
   const port = 39303
   const base: TraeCreditView = { region: 'cn', port, enabled: false }
   try {
-    const key = (await readFile(join(ROOT, '..', 'trae-proxy', 'keys', 'cn.key'), 'utf8')).trim()
+    const key = await readRegionKey('trae-proxy/keys/cn.key')
+    if (key === null) return { ...base, error: '缺少 key' }
     const r = await fetchJson(`http://${HOST}:${port}/credits`, key)
     if (!r.ok || typeof r.data !== 'object' || r.data === null) {
       return { ...base, error: r.error ?? `HTTP ${r.status ?? '?'}` }
@@ -280,7 +308,7 @@ async function probePort(port: number): Promise<boolean> {
 /** 从代理 /healthz 读取当前版本（需带该代理的 bearer，healthz 受鉴权保护）。 */
 async function readCurrentVersion(port: number, keyName: string): Promise<string | undefined> {
   try {
-    const key = await readRegionKey({ keyName } as RegionDef)
+    const key = await readRegionKey(keyName)
     if (key === null) return undefined
     const res = await fetch(`http://${HOST}:${port}/healthz`, {
       headers: { Authorization: `Bearer ${key}` },
@@ -324,9 +352,9 @@ async function checkUpdates(force: boolean): Promise<unknown> {
 }
 
 async function overview(): Promise<unknown> {
-  // allSettled 而非 all：任一区故障不能拖累整个面板 500（每 5 分钟刷新一次）。
+  // allSettled 而非 all：任一区故障不能拖累整个面板 500（前端每 15 分钟刷新一次）。
   const settled = await Promise.allSettled(REGIONS.map(async (def) => {
-    const key = await readRegionKey(def)
+    const key = await readRegionKey(def.keyName)
     const running = await probePort(def.port)
     if (!running) {
       return { ...def, running: false, auth: { state: 'offline' }, signin: null }
@@ -354,10 +382,37 @@ async function overview(): Promise<unknown> {
   return { regions: items, at: Date.now() }
 }
 
+/**
+ * /api/overview 响应缓存：前端会周期性刷新，而每次组装都要对最多 6 个代理
+ * 各发 /status 与 /signin/status 并读 key 文件。30 秒内复用同一份结果，
+ * 缓存内容就是 overview() 的原样返回，结构与字段完全不变。
+ *
+ * 单飞（single-flight）：并发未命中时只发起一次上游查询，
+ * 其余请求 await 同一个 Promise，避免缓存击穿/惊群。
+ */
+const OVERVIEW_TTL_MS = 30 * 1000
+let overviewCache: { at: number; data: unknown } | null = null
+let overviewInFlight: Promise<unknown> | null = null
+
+async function overviewCached(): Promise<unknown> {
+  if (overviewCache !== null && Date.now() - overviewCache.at < OVERVIEW_TTL_MS) {
+    return overviewCache.data
+  }
+  if (overviewInFlight === null) {
+    overviewInFlight = overview()
+      .then((data) => {
+        overviewCache = { at: Date.now(), data }
+        return data
+      })
+      .finally(() => { overviewInFlight = null })
+  }
+  return overviewInFlight
+}
+
 async function claim(id: string): Promise<{ ok: boolean; status?: number; data?: unknown; error?: string }> {
   const def = REGIONS.find(r => r.id === id)
   if (!def) return { ok: false, error: `未知区域：${id}` }
-  const key = await readRegionKey(def)
+  const key = await readRegionKey(def.keyName)
   if (!key) return { ok: false, error: '该区域缺少 key' }
   const res = await fetchJson(`http://${HOST}:${def.port}/signin/claim`, key, 'POST', 40000)
   return { ok: res.ok, status: res.status, data: res.data, error: res.error }
@@ -394,14 +449,14 @@ async function serveIndex(res: ServerResponse): Promise<void> {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
     res.end(indexHtmlCache)
   } catch {
-    res.writeHead(500); res.end('index.html missing')
+    res.writeHead(500); res.end('缺少 index.html')
   }
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = (req.url ?? '/').split('?')[0] ?? '/'
-  if (!hostIsLoopback(req.headers.host)) { res.writeHead(403); res.end('forbidden'); return }
-  if (!originIsLoopback(req.headers.origin)) { res.writeHead(403); res.end('forbidden'); return }
+  if (!hostIsLoopback(req.headers.host)) { res.writeHead(403); res.end('禁止访问'); return }
+  if (!originIsLoopback(req.headers.origin)) { res.writeHead(403); res.end('禁止访问'); return }
 
   // index 页面在浏览器直接访问时会带 key（?key=），便于拿到后写入 localStorage
   if (req.method === 'GET' && (url === '/' || url === '/index.html')) {
@@ -413,13 +468,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
   if (!authed(req)) {
     res.writeHead(401, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ error: 'unauthorized' }))
+    res.end(JSON.stringify({ error: '未授权' }))
     return
   }
 
   try {
     if (req.method === 'GET' && url === '/api/overview') {
-      const data = await overview()
+      const data = await overviewCached()
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
     }
     if (req.method === 'GET' && url === '/api/workbuddy/credits') {
@@ -441,7 +496,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const body = await readBody(req)
       let id = ''
       try { id = (JSON.parse(body) as { id?: string }).id ?? '' } catch { /* */ }
-      if (!id) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing id' })); return }
+      if (!id) { res.writeHead(400); res.end(JSON.stringify({ error: '缺少 id' })); return }
       const result = await claim(id)
       res.writeHead(result.ok ? 200 : 502, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(result)); return
@@ -454,10 +509,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const data = await checkUpdates(true)
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
     }
-    res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'not found' }))
+    res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: '未找到' }))
   } catch (error) {
-    log('error', 'hub request failed', error)
-    if (!res.headersSent) { res.writeHead(500); res.end(JSON.stringify({ error: 'internal' })) }
+    log('error', '面板请求处理失败：', error)
+    if (!res.headersSent) { res.writeHead(500); res.end(JSON.stringify({ error: '内部错误' })) }
   }
 }
 
