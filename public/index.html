@@ -58,9 +58,8 @@
   <div class="grid" id="creditGrid"></div>
   <div class="grid" id="grid"></div>
   <p class="muted footer-note">
-    数据来自本机各代理的回环接口（WorkBuddy 39301/39302、Trae 39303/39304、MiniMax 39305/39306、Qoder 39320）。
-    本面板不接触任何凭据，只做聚合展示与「立即签到」。自动签到默认每天 7–10 点随机执行，由各代理自身完成；
-    Qoder 因其奖励每日 10:00（UTC+8）刷新，签到窗口为 10 点之后。
+    数据来自本机各代理的回环接口（WorkBuddy 39301/39302、Trae 39303/39304、MiniMax 39305/39306）。
+    本面板不接触任何凭据，只做聚合展示与「立即签到」。自动签到默认每天 7–10 点随机执行，由各代理自身完成。
   </p>
 </main>
 <div id="toast"></div>
@@ -220,59 +219,6 @@ async function refreshCredits() {
       </div>`
     grid.innerHTML += card
   } catch (e) { /* Trae 额度不可用时静默 */ }
-  // Qoder 账号 / 额度 / 签到：独立请求，失败不影响其它卡片
-  try {
-    const q = await api('/api/qoder/status')
-    const regions = q.regions || []
-    const rows = regions.map(r => {
-      if (!r.loggedIn) {
-        return `<div class="row" style="margin-top:10px;padding-top:8px;border-top:1px dashed var(--line)">
-            <span class="k">${esc(r.label)}</span>
-            <span class="muted">${esc(r.error || '未登录')}</span>
-          </div>`
-      }
-      // 签到状态文案：已领 / 可领 / 未到刷新时间 / 该区域无活动
-      let signinText
-      if (r.todayCheckedIn === true) {
-        signinText = '<span style="color:var(--ok)">今日已领</span>'
-      } else if (r.claimable === true) {
-        signinText = `<span style="color:var(--accent)">可领 ${r.claimableAmount ?? 0}</span>`
-      } else if (r.hasBenefitCampaign === true) {
-        signinText = '<span class="muted">未到刷新时间</span>'
-      } else if (r.hasBenefitCampaign === false) {
-        signinText = '<span class="muted">无每日签到活动</span>'
-      } else {
-        signinText = '<span class="muted">—</span>'
-      }
-      const credit = r.remaining === undefined
-        ? '<span class="muted">额度未知</span>'
-        : `<b>${r.remaining} / ${r.total ?? '?'} ${esc(r.unit || 'credits')}</b>`
-      const streak = (r.streakDays !== undefined && r.streakDays > 0)
-        ? ` <span class="muted">· 连续 ${r.streakDays} 天</span>` : ''
-      // 有签到活动的区域才给「立即签到」按钮（国际版当前没有活动）。
-      const claimableNow = r.hasBenefitCampaign === true
-      const btn = claimableNow
-        ? `<button data-qoder="${esc(r.region)}" data-pretty="Qoder ${esc(r.label)}"${r.todayCheckedIn === true ? ' disabled' : ''}>立即签到</button>`
-        : ''
-      return `<div class="row" style="margin-top:10px;padding-top:8px;border-top:1px dashed var(--line)">
-          <span class="k">${esc(r.label)}</span>
-          <b>${esc(r.account || '(未识别账号)')}</b>
-        </div>
-        <div class="row"><span class="muted">套餐</span><span>${esc(r.planName || '—')}</span></div>
-        <div class="row"><span class="muted">额度</span><span>${credit}</span></div>
-        <div class="row"><span class="muted">签到</span><span>${signinText}${streak}</span></div>
-        <div class="row"><span class="muted">令牌</span><span class="muted">${esc(r.tokenExpiresIn || '—')}</span></div>
-        ${btn ? `<div class="row">${btn}</div>` : ''}`
-    }).join('')
-    const card = `
-      <div class="card">
-        <h2>Qoder <span class="tag">国内 + 国际 · :39320</span></h2>
-        <div class="row"><span>可用额度合计</span><b>${q.total ?? 0} credits</b></div>
-        ${rows || '<div class="row muted">暂无数据</div>'}
-        <div class="row"><span class="muted">${q.note ? esc(q.note) + '；' : ''}每日 10:00 后自动签到</span></div>
-      </div>`
-    grid.innerHTML += card
-  } catch (e) { /* Qoder 不可用时静默 */ }
 }
 
 async function claim(id) {
@@ -286,12 +232,12 @@ async function claim(id) {
 
 /** 立即签到单个平台（data-claim 按钮）。 */
 async function claimById(btn) {
-  const id = btn.dataset.claim || btn.dataset.qoder
+  const id = btn.dataset.claim
   const pretty = btn.dataset.pretty || id
   btn.disabled = true
   try {
     const r = await api('/api/signin/claim', 'POST', { id })
-    // Qoder 返回 { results:[{message}] }，其它代理返回 { entry:{result} }
+    // 代理返回 { entry:{result} }
     const msg = r.entry?.result || r.results?.[0]?.message || '已处理'
     toast(pretty + '：' + msg, 'ok')
   } catch (e) {
@@ -306,25 +252,11 @@ async function claimAll() {
   try {
     const data = await api('/api/overview')
     const targets = data.regions.filter(r => r.signin && !r.signin.error && r.signin.view && !r.signin.view.checkedIn)
-    // Qoder 不在 overview（单账号 per 区域、无 key），单独取一次
-    let qoderTargets = []
-    try {
-      const q = await api('/api/qoder/status')
-      qoderTargets = (q.regions || [])
-        .filter(r => r.loggedIn && r.hasBenefitCampaign === true && r.todayCheckedIn !== true)
-        .map(r => 'qoder:' + r.region)
-    } catch (e) { /* Qoder 不可用时忽略 */ }
-    const ids = targets.map(t => t.id).concat(qoderTargets)
+    const ids = targets.map(t => t.id)
     if (!ids.length) { toast('没有需要签到的平台'); return }
     for (const id of ids) { await claim(id) }
   } catch (e) { toast('批量签到失败：' + e.message, 'err') }
 }
-
-// 事件委托：Qoder 卡片里的「立即签到」按钮（data-qoder="cn|global"）。
-document.addEventListener('click', (ev) => {
-  const btn = ev.target.closest('button[data-qoder]')
-  if (btn !== null) { claimById(btn); return }
-})
 
 // 自动刷新：5 分钟一次；标签页不可见时暂停，切回时立即刷新一次。
 // 面板每次刷新都会向 WorkBuddy/Trae 上游查询余额，降低频率可避免频繁调用。
