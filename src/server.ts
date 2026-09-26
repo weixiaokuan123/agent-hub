@@ -14,6 +14,7 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { appendFileSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { Socket } from 'node:net'
@@ -58,14 +59,72 @@ const UPDATABLE: Array<{ name: string; repo: string; dirName: string; port: numb
 const UPDATE_PENDING_FILE = join(ROOT, 'state', 'update-pending.json')
 const UPDATE_CHECK_MS = 24 * 60 * 60 * 1000
 
+/**
+ * 日志落盘 + 运行期轮转。
+ *
+ * 历史上日志由 start.ps1 用 cmd 重定向（node ... >> out.log 2>> err.log），
+ * 文件句柄在 cmd 手里 —— 本进程拿不到句柄，**无法在运行期轮转**，只能在重启时
+ * 轮一次。后果是「长期不重启的进程，日志无上限增长」。
+ *
+ * 因此改为：若环境变量指明了日志路径，由本进程直接持有该文件并在超限时自行轮转；
+ * 未设置（前台调试）时退回 stdout/stderr。
+ *
+ * 轮转策略与 start.ps1 里的 Rotate-Log 保持一致：超限改名为 .1，只保留一份。
+ */
+
+/** 单个日志文件上限，与 start.ps1 的 Rotate-Log 同一阈值。 */
+const LOG_MAX_BYTES = 5 * 1024 * 1024
+
+interface LogSink {
+  path: string
+  /** 当前文件已有字节数，作为轮转基线。 */
+  size: number
+}
+
+function makeLogSink(envKey: string): LogSink | null {
+  const p = process.env[envKey]
+  if (p === undefined || p.trim() === '') return null
+  try {
+    mkdirSync(dirname(p), { recursive: true })
+    // 追加而非截断：既有内容保留，并把当前大小作为轮转基线
+    return { path: p, size: statSync(p, { throwIfNoEntry: false })?.size ?? 0 }
+  } catch {
+    return null // 建不出来就退回 stdout/stderr，不让日志问题拦住启动
+  }
+}
+
+function writeLogSink(sink: LogSink, text: string): void {
+  const bytes = Buffer.byteLength(text)
+  if (sink.size + bytes > LOG_MAX_BYTES) {
+    try {
+      rmSync(`${sink.path}.1`, { force: true })
+      renameSync(sink.path, `${sink.path}.1`)
+      sink.size = 0
+    } catch {
+      // 轮转失败就继续往当前文件追加：丢日志比不轮转更糟
+    }
+  }
+  appendFileSync(sink.path, text, 'utf8')
+  sink.size += bytes
+}
+
+const LOG_OUT = makeLogSink('AGENT_HUB_LOG_OUT')
+const LOG_ERR = makeLogSink('AGENT_HUB_LOG_ERR')
+
 function ts(): string {
   return new Date().toISOString()
 }
 
 function log(level: string, ...args: unknown[]): void {
   const line = `[${ts()}] [${level}] ${args.map(String).join(' ')}\n`
-  if (level === 'error' || level === 'warn') process.stderr.write(line)
-  else process.stdout.write(line)
+  const sink = level === 'error' || level === 'warn' ? LOG_ERR : LOG_OUT
+  if (sink !== null) {
+    writeLogSink(sink, line)
+  } else if (level === 'error' || level === 'warn') {
+    process.stderr.write(line)
+  } else {
+    process.stdout.write(line)
+  }
 }
 
 async function loadOrCreateHubKey(): Promise<string> {
@@ -576,8 +635,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     if (req.method === 'POST' && url.startsWith('/api/signin/claim')) {
       const body = await readBody(req)
+      if (!body.ok) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: '请求体过大' })); return }
       let id = ''
-      try { id = (JSON.parse(body) as { id?: string }).id ?? '' } catch { /* */ }
+      try { id = (JSON.parse(body.text) as { id?: string }).id ?? '' } catch { /* */ }
       if (!id) { res.writeHead(400); res.end(JSON.stringify({ error: '缺少 id' })); return }
       const result = await claim(id)
       res.writeHead(result.ok ? 200 : 502, { 'Content-Type': 'application/json' })
@@ -589,7 +649,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     if (req.method === 'POST' && url === '/api/update/apply') {
       const body = await readBody(req)
-      if (parseConfirm(body) !== 'apply') {
+      if (!body.ok) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: '请求体过大' })); return }
+      if (parseConfirm(body.text) !== 'apply') {
         auditApply(req, false, 'bad-confirm')
         res.writeHead(400, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: '缺少二次确认：请求体需为 {"confirm":"apply"}' }))
@@ -621,14 +682,48 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+const BODY_LIMIT = 1024 * 1024
+
+/**
+ * 读取请求体。
+ *
+ * 返回 ok=false 表示体积超限，调用方据此回 413。
+ *
+ * 超限时**不能** destroy 请求：destroy 会连带关掉 socket，客户端只会收到
+ * ECONNRESET，压根读不到任何响应（实测：2MB 请求体在 destroy 版本下直接连接重置，
+ * 而不是 400，更不是 413）。所以这里改为「停止累积、把剩余数据读掉」，
+ * 让请求能正常走完 end，响应才写得出去。
+ *
+ * 内存仍然有界：超限后不再往 chunks 里塞任何东西。读掉剩余流量只是多耗一点
+ * 带宽，而 readBody 只在鉴权通过之后才调用，攻击面限于已持有 key 的本地调用方。
+ *
+ * 长度按**字节**计（Buffer 长度）而非字符串长度：中文在 JS 里是 UTF-16 码元，
+ * 一个汉字只算 1，按字符串长度会低估到实际字节数的三分之一左右。
+ */
+type BodyResult = { ok: true; text: string } | { ok: false; tooLarge: true }
+
+function readBody(req: IncomingMessage): Promise<BodyResult> {
   return new Promise((resolve) => {
-    let data = ''
-    req.on('data', c => { data += String(c); if (data.length > 1024 * 1024) req.destroy() })
-    req.on('end', () => resolve(data))
-    req.on('error', () => resolve(''))
+    const chunks: Buffer[] = []
+    let size = 0
+    let tooLarge = false
+    req.on('data', (c: Buffer) => {
+      if (tooLarge) return // 已超限：继续读但不再累积，内存有界
+      size += c.length
+      if (size > BODY_LIMIT) {
+        tooLarge = true
+        chunks.length = 0
+        return
+      }
+      chunks.push(c)
+    })
+    req.on('end', () => resolve(
+      tooLarge ? { ok: false, tooLarge: true } : { ok: true, text: Buffer.concat(chunks).toString('utf8') },
+    ))
+    req.on('error', () => resolve({ ok: true, text: '' }))
   })
 }
+
 
 async function main(): Promise<void> {
   HUB_KEY = await loadOrCreateHubKey()
