@@ -72,7 +72,31 @@ export function isNewer(a: string, b: string): boolean {
   return ax > bx ? true : ax < bx ? false : ay > by ? true : ay < by ? false : az > bz
 }
 
-/** 查 GitHub 最新 release tag（优先 latest release，回退 tags 列表最新一个）。 */
+/** 语义化版本 tag（可带 v 前缀）。非此形状的一律不参与「最新版本」评选。 */
+const SEMVER_TAG = /^v?\d+\.\d+\.\d+$/
+
+/**
+ * 从一批 tag 名里挑出**版本号最大**的那个。
+ *
+ * 为什么不取第一个：GitHub 的 `/tags` 接口**不按 semver 排序**（大致按创建
+ * 时间倒序），所以「第一个匹配 semver 的」并不等于「最新的」。补一个旧版本的
+ * tag（回填历史、或者从别处 cherry-pick 过来）就可能让它排到前面，于是更新器
+ * 会认定「远端最新就是那个旧版本」，从此**再也提示不了更新**——一个静默失效的
+ * 自动更新比没有更新更糟。
+ *
+ * 抽成纯函数是为了能直接测：GitHub 返回顺序不可控，不构造一个「旧 tag 排在
+ * 前面」的输入就永远测不出这个 bug。
+ */
+export function maxSemverTag(names: readonly string[]): string | undefined {
+  let best: string | undefined
+  for (const raw of names) {
+    if (typeof raw !== 'string' || !SEMVER_TAG.test(raw)) continue
+    if (best === undefined || isNewer(raw, best)) best = raw
+  }
+  return best
+}
+
+/** 查 GitHub 最新 release tag（优先 latest release，回退 tags 列表里版本号最大的）。 */
 async function fetchLatestTag(repo: string): Promise<string | undefined> {
   const ctrl = AbortSignal.timeout(CHECK_TIMEOUT_MS)
   try {
@@ -82,7 +106,10 @@ async function fetchLatestTag(repo: string): Promise<string | undefined> {
     })
     if (res.ok) {
       const j = await res.json() as { tag_name?: string }
-      if (j.tag_name) return j.tag_name
+      // 同样要校验形状：release 的 tag_name 是人填的，出现非 semver 时不能让它
+      // 污染版本比较（parseSemver 失败会返回 [0,0,0]，等于宣称「远端是 0.0.0」，
+      // 那样 hasUpdate 恒为 false）。
+      if (typeof j.tag_name === 'string' && SEMVER_TAG.test(j.tag_name)) return j.tag_name
     }
   } catch {
     // 回退到 tags
@@ -93,8 +120,8 @@ async function fetchLatestTag(repo: string): Promise<string | undefined> {
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
     })
     if (res.ok) {
-      const arr = await res.json() as Array<{ name: string }>
-      return arr.find(t => /^v?\d+\.\d+\.\d+$/.test(t.name))?.name
+      const arr = await res.json() as Array<{ name?: string }>
+      return maxSemverTag((Array.isArray(arr) ? arr : []).map(t => t?.name).filter((n): n is string => typeof n === 'string'))
     }
   } catch {
     // 离线：静默
