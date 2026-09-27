@@ -66,6 +66,30 @@
     </div>
     <pre id="dry-out">（尚未执行）</pre>
   </section>
+
+  <section>
+    <h2>OCR / 识别 · 处理（会消耗额度）</h2>
+    <div class="row">
+      <label for="proc-dir">输入目录</label>
+      <input type="text" id="proc-dir" placeholder="留空则需填文件，但本版暂不支持逐个选文件">
+    </div>
+    <div class="row">
+      <label for="proc-timeout">超时（分钟）</label>
+      <input type="text" id="proc-timeout" placeholder="0 = 不超时" style="max-width:120px;min-width:0">
+      <button id="btn-proc">开始处理</button>
+      <span class="hint">超时会保存进度，之后可续跑</span>
+    </div>
+    <pre id="proc-out">（尚未执行）</pre>
+  </section>
+
+  <section>
+    <h2>OCR / 识别 · 状态</h2>
+    <div class="row">
+      <button id="btn-status">查状态</button>
+      <button id="btn-poll" class="primary">续跑未完成任务</button>
+    </div>
+    <pre id="status-out">（尚未查询）</pre>
+  </section>
 </main>
 
 <script>
@@ -203,11 +227,56 @@ bind('btn-dry', function () {
   });
 });
 
+bind('btn-proc', function () {
+  var dir = document.getElementById('proc-dir').value.trim();
+  var rawT = document.getElementById('proc-timeout').value.trim();
+  var t = rawT === '' ? 0 : parseInt(rawT, 10);
+  if (!dir) { throw new Error('请填输入目录（本骨架版暂不支持逐个选文件）'); }
+  if (isNaN(t) || t < 0) { throw new Error('超时必须是 0 或正整数（分钟）'); }
+  if (!confirm('将真实上传并调用 OCR 服务，会消耗配额。' + (t > 0 ? '（超时 ' + t + ' 分钟）' : '') + '确定继续？')) {
+    return Promise.resolve();
+  }
+  var payload = { inputDir: dir };
+  if (t > 0) { payload.timeoutMin = t; }
+  return api('/process', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).then(function (d) {
+    document.getElementById('proc-out').textContent = JSON.stringify(d, null, 2);
+    // 退出码 6 是「有任务未完成，可续跑」，不是错误，用绿色提示。
+    var good = d.exitCode === 0 || d.exitCode === 6;
+    showMsg('处理结束：' + (d.exitMeaning || ''), good ? 'ok' : 'err');
+    // 结果里若提到还有未完成的任务，顺手把状态刷出来，省一次点击。
+    if (d.exitCode === 6) { document.getElementById('btn-status').click(); }
+  });
+});
+
+bind('btn-status', function () {
+  return api('/status').then(function (d) {
+    var txt = JSON.stringify(d, null, 2);
+    if (d.note) { txt = d.note + '\n\n' + txt; }
+    document.getElementById('status-out').textContent = txt;
+    var n = (d.tasks && d.tasks.length) || 0;
+    showMsg(n === 0 ? '没有待续跑的任务' : ('有 ' + n + ' 个任务等待续跑'), 'ok');
+  });
+});
+
+bind('btn-poll', function () {
+  if (!confirm('将续跑未完成的任务，会继续消耗配额。确定继续？')) {
+    return Promise.resolve();
+  }
+  return api('/poll', { method: 'POST' }).then(function (d) {
+    document.getElementById('status-out').textContent = JSON.stringify(d, null, 2);
+    var good = d.exitCode === 0 || d.exitCode === 6;
+    showMsg('续跑结束：' + (d.exitMeaning || ''), good ? 'ok' : 'err');
+  });
+});
+
 // 进页面自动读一次配置，省一次点击。
 document.addEventListener('DOMContentLoaded', function () {
   if (hubKey()) { document.getElementById('btn-info').click(); }
   else { showMsg('没有 hub-key。请先访问 http://127.0.0.1:39310/?key=你的key 完成首次授权。', 'err'); }
-});
-</script>
+});</script>
 </body>
 </html>

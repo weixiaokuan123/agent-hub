@@ -142,3 +142,154 @@ test('/tool/api/dry-run 缺 inputDir 时返回 400，不调用 CLI', async () =>
   assert.match(captured.body, /inputDir/)
   assert.equal(called, false, '缺参时不该调用 CLI')
 })
+
+/**
+ * 造一个带 JSON body 的假 POST 请求。
+ *
+ * 路由层的 readBody 靠 'data' + 'end' 事件累积缓冲区，所以假 req 必须
+ * 能发这两个事件。用一个最小的 EventEmitter 形状就够。
+ */
+function fakePostReq(body: unknown): IncomingMessage {
+  const payload = Buffer.from(JSON.stringify(body), 'utf8')
+  const handlers: Record<string, Array<(arg?: unknown) => void>> = { data: [], end: [], error: [] }
+  const req = {
+    method: 'POST',
+    headers: { authorization: 'Bearer test-key', 'content-type': 'application/json' },
+    on: (event: string, cb: (arg?: unknown) => void) => {
+      handlers[event] = handlers[event] ?? []
+      handlers[event].push(cb)
+      return req
+    },
+  }
+  // 用微任务把事件推迟到 router 已经注册好监听之后
+  queueMicrotask(() => {
+    for (const cb of handlers['data'] ?? []) cb(payload)
+    for (const cb of handlers['end'] ?? []) cb()
+  })
+  return req as unknown as IncomingMessage
+}
+
+test('认领 POST /tool/api/process', async () => {
+  const router = createToolRouter(deps)
+  const { res, captured } = fakeRes()
+  const handled = await router(fakePostReq({ inputDir: 'X:\\tmp' }), res, '/tool/api/process')
+  assert.equal(handled, true)
+  assert.notEqual(captured.status, 404, '/tool/api/process 尚未实现')
+})
+
+test('认领 GET /tool/api/status', async () => {
+  const router = createToolRouter(deps)
+  const { res, captured } = fakeRes()
+  const handled = await router(fakeReq('GET', true), res, '/tool/api/status')
+  assert.equal(handled, true)
+  assert.notEqual(captured.status, 404, '/tool/api/status 尚未实现')
+})
+
+test('/tool/api/process 用 GET 时 405', async () => {
+  const router = createToolRouter(deps)
+  const { res, captured } = fakeRes()
+  await router(fakeReq('GET', true), res, '/tool/api/process')
+  assert.equal(captured.status, 405)
+})
+
+test('/tool/api/process 既没 inputDir 也没 files 时 400，不调用 CLI', async () => {
+  let called = false
+  const router = createToolRouter({
+    ...deps,
+    runCli: async (o) => { called = true; return fakeRunCli()(o) },
+  })
+  const { res, captured } = fakeRes()
+  await router(fakePostReq({}), res, '/tool/api/process')
+  assert.equal(captured.status, 400)
+  assert.match(captured.body, /inputDir|files/)
+  assert.equal(called, false, '缺参时不该调用 CLI')
+})
+
+test('/tool/api/process 把 --input-dir 传给 CLI', async () => {
+  let seenArgs: string[] = []
+  const router = createToolRouter({
+    ...deps,
+    runCli: async (o) => { seenArgs = o.args; return fakeRunCli()(o) },
+  })
+  const { res } = fakeRes()
+  await router(fakePostReq({ inputDir: 'X:\\papers' }), res, '/tool/api/process')
+  assert.deepEqual(seenArgs, ['process', '--input-dir', 'X:\\papers'])
+})
+
+test('/tool/api/process 用 --files 逐个传文件', async () => {
+  let seenArgs: string[] = []
+  const router = createToolRouter({
+    ...deps,
+    runCli: async (o) => { seenArgs = o.args; return fakeRunCli()(o) },
+  })
+  const { res } = fakeRes()
+  await router(fakePostReq({ files: ['A.pdf', 'B.pdf'] }), res, '/tool/api/process')
+  assert.deepEqual(seenArgs, ['process', '--files', 'A.pdf', 'B.pdf'])
+})
+
+test('/tool/api/process 传了 timeoutMin 时带上 --timeout', async () => {
+  let seenArgs: string[] = []
+  const router = createToolRouter({
+    ...deps,
+    runCli: async (o) => { seenArgs = o.args; return fakeRunCli()(o) },
+  })
+  const { res } = fakeRes()
+  await router(fakePostReq({ inputDir: 'X:\\p', timeoutMin: 5 }), res, '/tool/api/process')
+  assert.ok(seenArgs.includes('--timeout'), '应带上 --timeout')
+  assert.equal(seenArgs[seenArgs.indexOf('--timeout') + 1], '5')
+})
+
+test('/tool/api/process 退出码 6（待续跑）算成功，返回 200', async () => {
+  const router = createToolRouter({
+    ...deps,
+    runCli: fakeRunCli({ code: 6, json: { ok: true, pending: ['a.pdf'] } }),
+  })
+  const { res, captured } = fakeRes()
+  await router(fakePostReq({ inputDir: 'X:\\p' }), res, '/tool/api/process')
+  assert.equal(captured.status, 200, '退出码 6 是可续跑的正常状态，不该报错')
+  const parsed = JSON.parse(captured.body) as { exitCode: number; exitMeaning: string }
+  assert.equal(parsed.exitCode, 6)
+  assert.match(parsed.exitMeaning, /续跑|未完成/)
+})
+
+test('/tool/api/process 退出码 4（全失败）返回 502，带上退出码与说明', async () => {
+  const router = createToolRouter({
+    ...deps,
+    runCli: fakeRunCli({ code: 4, json: null, stderr: '全部失败' }),
+  })
+  const { res, captured } = fakeRes()
+  await router(fakePostReq({ inputDir: 'X:\\p' }), res, '/tool/api/process')
+  assert.equal(captured.status, 502)
+  const parsed = JSON.parse(captured.body) as { exitCode: number; exitMeaning: string }
+  assert.equal(parsed.exitCode, 4)
+  assert.match(parsed.exitMeaning, /失败/)
+})
+
+test('/tool/api/poll 调 poll 子命令（不是 process）', async () => {
+  let seenArgs: string[] = []
+  const router = createToolRouter({
+    ...deps,
+    runCli: async (o) => { seenArgs = o.args; return fakeRunCli()(o) },
+  })
+  const { res, captured } = fakeRes()
+  await router(fakePostReq({}), res, '/tool/api/poll')
+  assert.equal(captured.status, 200)
+  assert.deepEqual(seenArgs, ['poll'])
+})
+
+test('/tool/api/poll 退出码 6 仍算成功（还有没跑完的）', async () => {
+  const router = createToolRouter({
+    ...deps,
+    runCli: fakeRunCli({ code: 6, json: { ok: true, pending: ['x.pdf'] } }),
+  })
+  const { res, captured } = fakeRes()
+  await router(fakePostReq({}), res, '/tool/api/poll')
+  assert.equal(captured.status, 200)
+})
+
+test('/tool/api/poll 用 GET 时 405', async () => {
+  const router = createToolRouter(deps)
+  const { res, captured } = fakeRes()
+  await router(fakeReq('GET', true), res, '/tool/api/poll')
+  assert.equal(captured.status, 405)
+})

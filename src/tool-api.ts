@@ -100,6 +100,76 @@ export function createToolRouter(
         return true
       }
 
+      // ---- POST /tool/api/process：真实跑一批（会消耗额度）----
+      if (route === '/process') {
+        if (req.method !== 'POST') { json(res, 405, { error: '方法不允许' }); return true }
+        const body = await readBody(req)
+        if (body === null) { json(res, 413, { error: '请求体过大' }); return true }
+
+        let inputDir = ''
+        let files: string[] = []
+        let timeoutMin = 0
+        try {
+          const parsed = JSON.parse(body || '{}') as {
+            inputDir?: unknown; files?: unknown; timeoutMin?: unknown
+          }
+          if (typeof parsed.inputDir === 'string') inputDir = parsed.inputDir
+          if (Array.isArray(parsed.files)) {
+            files = parsed.files.filter((f): f is string => typeof f === 'string' && f !== '')
+          }
+          if (typeof parsed.timeoutMin === 'number' && parsed.timeoutMin > 0) timeoutMin = parsed.timeoutMin
+        } catch { /* 解析失败按缺参处理 */ }
+
+        if (inputDir === '' && files.length === 0) {
+          json(res, 400, { error: '至少需要 inputDir 或 files 之一' })
+          return true
+        }
+
+        const args = ['process']
+        if (inputDir !== '') args.push('--input-dir', inputDir)
+        if (files.length > 0) args.push('--files', ...files)
+        if (timeoutMin > 0) args.push('--timeout', String(timeoutMin))
+
+        // 本地超时比 CLI 自己的 timeout 多留 1 分钟，让 CLI 有时间保存状态（退出码 6）并正常退出。
+        const localTimeoutMs = timeoutMin > 0 ? (timeoutMin + 1) * 60_000 : 0
+        const r = await runCli({ args, timeoutMs: localTimeoutMs })
+
+        // 退出码 6 = 有任务未完成，是可续跑的正常状态，不是错误。
+        const isResumable = r.code === 6
+        const status = r.ok || isResumable ? 200 : 502
+        const base = r.json !== null && typeof r.json === 'object'
+          ? r.json as Record<string, unknown>
+          : { error: describeExitCode(r.code), stderr: r.stderr }
+        json(res, status, { ...base, exitCode: r.code, exitMeaning: describeExitCode(r.code) })
+        return true
+      }
+
+      // ---- GET /tool/api/status：查询 cli_state.json 里任务的状态 ----
+      if (route === '/status') {
+        if (req.method !== 'GET') { json(res, 405, { error: '方法不允许' }); return true }
+        const r = await runCli({ args: ['status'] })
+        if (r.json === null) {
+          json(res, 502, { error: describeExitCode(r.code), code: r.code, stderr: r.stderr })
+          return true
+        }
+        json(res, 200, r.json)
+        return true
+      }
+
+      // ---- POST /tool/api/poll：续跑 cli_state.json 里未完成的任务 ----
+      if (route === '/poll') {
+        if (req.method !== 'POST') { json(res, 405, { error: '方法不允许' }); return true }
+        // poll 是长活（要等远端任务出结果），超时留 30 分钟，比 process 宽松。
+        const r = await runCli({ args: ['poll'], timeoutMs: 30 * 60_000 })
+        const isResumable = r.code === 6
+        const status = r.ok || isResumable ? 200 : 502
+        const base = r.json !== null && typeof r.json === 'object'
+          ? r.json as Record<string, unknown>
+          : { error: describeExitCode(r.code), stderr: r.stderr }
+        json(res, status, { ...base, exitCode: r.code, exitMeaning: describeExitCode(r.code) })
+        return true
+      }
+
       json(res, 404, { error: '未找到' })
       return true
     } catch (error) {
