@@ -5,12 +5,209 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>综合工具台</title>
 <style>
-  body { font-family: system-ui, "Microsoft YaHei", sans-serif; margin: 0; padding: 2rem; background: #f7f7f8; color: #222; }
-  h1 { font-size: 1.4rem; }
+  :root { --fg:#1f2328; --muted:#656d76; --line:#d0d7de; --bg:#fff; --accent:#0969da; --ok:#1a7f37; --bad:#cf222e; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "Microsoft YaHei", sans-serif; margin:0; background:#f6f8fa; color:var(--fg); }
+  header { background:var(--bg); border-bottom:1px solid var(--line); padding:14px 22px; display:flex; align-items:baseline; gap:16px; flex-wrap:wrap; }
+  header h1 { font-size:1.1rem; margin:0; }
+  header .sub { color:var(--muted); font-size:.82rem; }
+  header nav { margin-left:auto; font-size:.82rem; }
+  header nav a { color:var(--accent); text-decoration:none; }
+  header nav a:hover { text-decoration:underline; }
+  main { max-width:900px; margin:0 auto; padding:22px; }
+  section { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:18px; margin-bottom:16px; }
+  section h2 { font-size:.95rem; margin:0 0 14px; padding-bottom:10px; border-bottom:1px solid var(--line); }
+  .row { display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+  label { min-width:96px; color:var(--muted); font-size:.85rem; }
+  input[type=text] { flex:1; min-width:260px; padding:7px 10px; border:1px solid var(--line); border-radius:6px; font-size:.88rem; font-family:inherit; }
+  button { padding:7px 15px; border:1px solid var(--line); background:var(--bg); border-radius:6px; cursor:pointer; font-size:.88rem; font-family:inherit; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  pre { background:#f6f8fa; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; font-size:.82rem; max-height:420px; margin:0; white-space:pre-wrap; word-break:break-all; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:5px 14px; font-size:.85rem; margin:0; }
+  .kv dt { color:var(--muted); }
+  .kv dd { margin:0; word-break:break-all; }
+  .msg { font-size:.84rem; padding:8px 12px; border-radius:6px; margin-bottom:12px; display:none; }
+  .msg.show { display:block; }
+  .msg.err { background:#fff0f0; color:var(--bad); border:1px solid #ffd0d0; }
+  .msg.ok { background:#f0fff4; color:var(--ok); border:1px solid #c8f0d4; }
+  .hint { color:var(--muted); font-size:.8rem; }
+  .empty { color:var(--muted); font-size:.85rem; }
 </style>
 </head>
 <body>
+<header>
   <h1>综合工具台</h1>
-  <p>骨架已就位。（内容在后续任务中填充）</p>
+  <span class="sub">骨架版 · 已接通 OCR 模块</span>
+  <nav><a href="/" id="link-panel">← 返回代理面板</a></nav>
+</header>
+<main>
+  <div id="msg" class="msg"></div>
+
+  <section>
+    <h2>OCR / 识别 · 配置</h2>
+    <div class="row">
+      <button id="btn-info" class="primary">读取配置</button>
+      <span class="hint" id="info-time"></span>
+    </div>
+    <dl class="kv" id="info-out"></dl>
+    <p class="empty" id="info-empty">点「读取配置」查看当前服务商、密钥与配额。</p>
+  </section>
+
+  <section>
+    <h2>OCR / 识别 · 预演（不烧额度）</h2>
+    <div class="row">
+      <label for="input-dir">输入目录</label>
+      <input type="text" id="input-dir" placeholder="例如 D:\OneDrive\学术\要处理的论文">
+    </div>
+    <div class="row">
+      <button id="btn-dry" class="primary">看计划</button>
+      <span class="hint">只列清单，不上传、不调用模型</span>
+    </div>
+    <pre id="dry-out">（尚未执行）</pre>
+  </section>
+</main>
+
+<script>
+// key 与签到面板共用同一个 localStorage 键，首次访问面板时已写入。
+var LS_KEY = 'agent-hub-key';
+
+function hubKey() {
+  var k = '';
+  try { k = localStorage.getItem(LS_KEY) || ''; } catch (e) { k = ''; }
+  if (!k) {
+    // 也允许通过 ?key= 直接进入工具台（与面板一致的做法）
+    try {
+      var u = new URLSearchParams(location.search).get('key');
+      if (u) { k = u; localStorage.setItem(LS_KEY, u); }
+    } catch (e) { /* 忽略 */ }
+  }
+  return k;
+}
+
+function showMsg(text, kind) {
+  var el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = 'msg show ' + (kind || '');
+}
+
+function clearMsg() {
+  var el = document.getElementById('msg');
+  el.className = 'msg';
+}
+
+/** 统一的同源请求。key 缺失时给出明确指引，而不是让请求 401 后一头雾水。 */
+function api(path, options) {
+  var key = hubKey();
+  if (!key) {
+    return Promise.reject(new Error('没有 hub-key。请先访问 http://127.0.0.1:39310/?key=你的key 完成首次授权。'));
+  }
+  var opts = options || {};
+  opts.headers = Object.assign({ 'Authorization': 'Bearer ' + key }, opts.headers || {});
+  return fetch('/tool/api' + path, opts).then(function (r) {
+    return r.text().then(function (t) {
+      var data;
+      try { data = JSON.parse(t); } catch (e) { data = { error: t }; }
+      if (!r.ok) {
+        // 服务端把退出码语义放在 error 字段里（如「参数错误（…）」），
+        // 直接抛出来，用户看到的就是人话而不是 HTTP 502。
+        var msg = (data && data.error) || ('HTTP ' + r.status);
+        if (data && data.stderr) { msg += '\n' + String(data.stderr).trim(); }
+        throw new Error(msg);
+      }
+      return data;
+    });
+  });
+}
+
+function esc(v) {
+  return String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function renderInfo(d) {
+  var rows = [
+    ['服务商', d.provider],
+    ['接口地址', d.api_base_url],
+    ['模型', d.model],
+    ['密钥数量', d.api_key_count],
+    ['配额（已用/总量）', d.quota_files_used + ' / ' + d.quota_files_total],
+    ['配额剩余', d.quota_files_remaining],
+    ['默认输入目录', d.input_dir],
+    ['输出目录', d.output_dir],
+    ['状态文件', d.state_file],
+  ];
+  var html = '';
+  rows.forEach(function (r) {
+    html += '<dt>' + esc(r[0]) + '</dt><dd>' + esc(r[1] == null ? '—' : r[1]) + '</dd>';
+  });
+  document.getElementById('info-out').innerHTML = html;
+  document.getElementById('info-empty').style.display = 'none';
+  document.getElementById('info-time').textContent = '更新于 ' + new Date().toLocaleTimeString();
+}
+
+function renderPlan(d) {
+  var lines = [];
+  lines.push('可执行文件数：' + ((d.plan && d.plan.length) || 0));
+  lines.push('配额剩余：' + d.quota_files_remaining + ' / ' + d.quota_files_total);
+  if (d.violations && d.violations.length) {
+    lines.push('');
+    lines.push('注意（' + d.violations.length + ' 条）：');
+    d.violations.forEach(function (v) { lines.push('  · ' + JSON.stringify(v)); });
+  }
+  if (d.plan && d.plan.length) {
+    lines.push('');
+    lines.push('计划：');
+    d.plan.forEach(function (p) {
+      lines.push('  · ' + p.file);
+      lines.push('      页数 ' + p.pages + '，动作 ' + p.action + (p.output_exists ? '（输出已存在）' : ''));
+    });
+  } else {
+    lines.push('');
+    lines.push('（没有需要处理的文件）');
+  }
+  document.getElementById('dry-out').textContent = lines.join('\n');
+}
+
+/** 统一绑定：禁用按钮 → 跑 → 恢复。失败一律走 msg 区，不让异常冒到控制台。 */
+function bind(id, fn) {
+  var btn = document.getElementById(id);
+  btn.addEventListener('click', function () {
+    clearMsg();
+    btn.disabled = true;
+    var restore = function () { btn.disabled = false; };
+    Promise.resolve()
+      .then(fn)
+      .then(function () { restore(); })
+      .catch(function (e) { restore(); showMsg(e.message, 'err'); });
+  });
+}
+
+bind('btn-info', function () {
+  return api('/info').then(function (d) {
+    renderInfo(d);
+    showMsg('配置已读取', 'ok');
+  });
+});
+
+bind('btn-dry', function () {
+  var dir = document.getElementById('input-dir').value.trim();
+  if (!dir) { throw new Error('请先填输入目录'); }
+  return api('/dry-run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ inputDir: dir }),
+  }).then(function (d) {
+    renderPlan(d);
+    showMsg('预演完成，未消耗任何额度', 'ok');
+  });
+});
+
+// 进页面自动读一次配置，省一次点击。
+document.addEventListener('DOMContentLoaded', function () {
+  if (hubKey()) { document.getElementById('btn-info').click(); }
+  else { showMsg('没有 hub-key。请先访问 http://127.0.0.1:39310/?key=你的key 完成首次授权。', 'err'); }
+});
+</script>
 </body>
 </html>
