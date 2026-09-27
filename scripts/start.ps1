@@ -53,7 +53,9 @@ if ($Foreground) {
 if (All-PortsUp $Ports) {
   $key = (Get-Content (Join-Path $Root 'keys\hub.key') -Raw).Trim()
   Write-Host "agent-hub already running"
-  Write-Host "  open: http://127.0.0.1:39310/?key=$key"
+  # 只显示前 6 位：这个 key 等价于本机全部账号的读取权 + /api/update/apply 的执行权，
+  # 而 stdout 会被重定向、被录屏、被 CI 采集。完整 key 请自行打开 keys\hub.key。
+  Write-Host ("  open: http://127.0.0.1:39310/?key={0}...  (完整 key 见 keys\hub.key)" -f $key.Substring(0, [Math]::Min(6, $key.Length)))
   exit 0
 }
 
@@ -88,7 +90,8 @@ if (All-PortsUp $Ports) {
   if ($procId -gt 0) { Set-Content -Path $PidFile -Value $procId -Encoding ASCII }
   $key = (Get-Content (Join-Path $Root 'keys\hub.key') -Raw).Trim()
   Write-Host "agent-hub started (PID $procId)"
-  Write-Host "  open: http://127.0.0.1:39310/?key=$key"
+  # 同上：不打完整 key。
+  Write-Host ("  open: http://127.0.0.1:39310/?key={0}...  (完整 key 见 keys\hub.key)" -f $key.Substring(0, [Math]::Min(6, $key.Length)))
 } else {
   Write-Host "agent-hub failed to start; check $ErrLog"
   Get-Content $ErrLog -ErrorAction SilentlyContinue

@@ -352,6 +352,25 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
 }
 
+/**
+ * 强制转成有限数字再插进 HTML。
+ *
+ * 面板把上游 JSON 的字段直接拼进 innerHTML，而「看起来是数字」的字段
+ * （credits.total、region.port、models…）并没有类型保护：真返回字符串就会
+ * 变成可执行标记。统一用 Number() 收敛掉这一整类，比逐处提防可靠。
+ */
+function n(v, fallback = 0) {
+  const x = typeof v === 'number' ? v : Number(v)
+  return Number.isFinite(x) ? x : fallback
+}
+
+/** 模型数量：数组取长度，数字直接用，其它一律当未知（绝不把原始值塞进 HTML）。 */
+function modelCount(models) {
+  if (Array.isArray(models)) return models.length
+  if (typeof models === 'number' && Number.isFinite(models)) return models
+  return '—'
+}
+
 /** 错误文案只留首句并限长，避免撑爆卡片；完整内容放 title 里 hover 可看。 */
 function brief(msg, max = 60) {
   const s = String(msg)
@@ -464,7 +483,7 @@ function travelStats(r) {
 
 function travelBadge(a) {
   const justClaimed = a.claimedAtMs && (Date.now() - a.claimedAtMs) < 3600e3 && a.claimedCredit > 0
-  if (justClaimed) return '<span class="badge ok">' + ICON.ok + '刚领 +' + a.claimedCredit + '</span>'
+  if (justClaimed) return '<span class="badge ok">' + ICON.ok + '刚领 +' + n(a.claimedCredit) + '</span>'
   if (a.state === 'traveling' || a.state === 'arrived') {
     return '<span class="badge ing">旅行中' + (a.locationName ? '·' + esc(a.locationName) : '') + '</span>'
   }
@@ -624,7 +643,7 @@ function renderHeroChips() {
     byProvider[p].list.push(r)
   }
   const running = regions.filter(r => r.running !== false).length
-  const totalCredits = DATA.wbCredits?.total
+  const totalCredits = DATA.wbCredits ? n(DATA.wbCredits.total) : undefined
   // 只有「你确实该动手」的才标红。凭据不可用但账号库已顶替属于已知情况，
   // 若也算进去，三个平台会永远全红，等于没有告警。
   const todoProviders = new Set(collectAttention().todo.map(x => x.provider))
@@ -667,7 +686,7 @@ function renderOverview() {
   const dispatchOn = travelAll.some(t => t.count > 0) ? travelAll[0].enabled : true
 
   let html = `<div class="stat-strip">
-    <div class="stat brand"><b class="num">${DATA.wbCredits?.total ?? '—'}</b><span>WorkBuddy 积分</span></div>
+    <div class="stat brand"><b class="num">${DATA.wbCredits ? n(DATA.wbCredits.total) : '—'}</b><span>WorkBuddy 积分</span></div>
     <div class="stat ${blockedTargets ? 'amber' : 'green'}"><b class="num">${allTargets.length ? signedTargets + '/' + allTargets.length : '—'}</b><span>今日签到${blockedTargets ? ' · ' + blockedTargets + ' 受阻' : ''}</span></div>
     <div class="stat"><b class="num">${travelTotal ? traveling + '/' + travelTotal : '—'}</b><span>旅行中</span></div>
     <div class="stat ${dispatchOn ? '' : 'amber'}"><b class="num">${dispatchOn ? '开启' : '暂停'}</b><span>自动派遣</span></div>
@@ -708,8 +727,8 @@ function renderOverview() {
       ${list.map(r => {
         const a = authOf(r)
         const models = Array.isArray(r.models) ? r.models.length : (r.models ?? '—')
-        return `<div class="row"><span class="k">${esc(r.label)} <span class="tiny">:${r.port}</span></span>
-          <span class="v">${a.badge} <span class="tiny num">${models} 模型</span></span></div>`
+        return `<div class="row"><span class="k">${esc(r.label)} <span class="tiny">:${n(r.port)}</span></span>
+          <span class="v">${a.badge} <span class="tiny num">${modelCount(models)} 模型</span></span></div>`
       }).join('')}
       <div class="row sub"><span class="k">今日签到</span><span class="v">${signinCell(list)}</span></div>
       ${tv ? `<div class="row"><span class="k">旅行</span><span class="v"><span class="pill ${tv.enabled ? 'on' : 'pause'}">${tv.enabled ? '自动派遣开启' : '已暂停'}</span></span></div>` : ''}
@@ -739,10 +758,10 @@ function signinHtml(r) {
     const btnDisabled = si.legacy.unsupported || si.legacy.checked
     return `<div class="divider"></div>
       <div class="row"><span class="k">签到</span><span class="v">${badge}</span></div>
-      <div class="row"><span class="k">获得积分</span><span class="v num">${credits}${streak ? ' · 连签 ' + streak : ''}</span></div>
+      <div class="row"><span class="k">获得积分</span><span class="v num">${n(credits)}${n(streak) ? ' · 连签 ' + n(streak) : ''}</span></div>
       <div class="row"><span class="k">计划时刻</span><span class="v num">${esc(s.scheduledAt || '—')}</span></div>
       ${s.lastResult ? `<div class="row"><span class="k">最近结果</span><span class="v muted">${esc(brief(s.lastResult, 40))}</span></div>` : ''}
-      <div class="btn-row" style="margin-top:10px"><button class="btn sm brand" onclick="claimOne('${esc(r.id)}')" ${
+      <div class="btn-row" style="margin-top:10px"><button class="btn sm brand" data-act="claim" data-region="${esc(r.id)}" ${
         btnDisabled ? 'disabled title="' + (si.legacy.unsupported ? '该区域不支持自动签到' : '今日已领取') + '"' : ''
       }>立即签到</button></div>`
   }
@@ -750,7 +769,7 @@ function signinHtml(r) {
   // 全部未领目标都已被服务端判定（token 加密 / 活动未开启）时按钮置灰：
   // 这时点下去必然拿不到积分，却会让人以为操作失败了。
   const openable = si.legacy ? !si.legacy.unsupported : si.targets.some(t => !t.claimedToday && !isBlocked(t))
-  const signinBtn = `<div class="btn-row" style="margin-top:10px"><button class="btn sm brand" onclick="claimOne('${esc(r.id)}')" ${
+  const signinBtn = `<div class="btn-row" style="margin-top:10px"><button class="btn sm brand" data-act="claim" data-region="${esc(r.id)}" ${
     allDone || !openable ? 'disabled title="' + (allDone ? '今日已全部领取' : '剩余目标均无法领取（见上方原因）') + '"' : ''
   }>立即签到</button></div>`
   return `<div class="divider"></div>
@@ -787,9 +806,9 @@ function travelHtml(r) {
     <div class="row">
       <span class="k">自动派遣</span>
       <span class="v act"><span class="pill ${t.enabled ? 'on' : 'pause'}">${t.enabled ? '已开启' : '已暂停（在途仍领取）'}</span>
-      <button class="btn sm" id="tg-${esc(r.id)}" onclick="setDispatch('${esc(r.id)}',${t.enabled ? 'false' : 'true'})">${t.enabled ? '暂停' : '开启'}</button></span>
+      <button class="btn sm" id="tg-${esc(r.id)}" data-act="dispatch" data-region="${esc(r.id)}" data-on="${t.enabled ? 'false' : 'true'}">${t.enabled ? '暂停' : '开启'}</button></span>
     </div>
-    <div class="row"><span class="k">可派时段</span><span class="v tiny num">${w.startHour ?? 8}:00–${w.endHour ?? 23}:00 · 每账号每天 1 次</span></div>
+    <div class="row"><span class="k">可派时段</span><span class="v tiny num">${n(w.startHour, 8)}:00–${n(w.endHour, 23)}:00 · 每账号每天 1 次</span></div>
     <div class="acct-list" style="margin-top:8px">
       ${t.list.map(a => {
         const off = notDispatchable(a)
@@ -802,12 +821,12 @@ function travelHtml(r) {
         return `<div class="acct">
           <span class="nm">${esc(a.label)}</span>
           <span class="meta">${travelBadge(a)} <span class="tiny" data-travel-remain="${(a.arriveAt && a.serverNow && a.arriveAt > a.serverNow) ? Date.now() + (a.arriveAt - a.serverNow) * 1000 : 0}">${a.state === 'traveling' ? travelRemaining(a) : (off ? esc(why) : '')}</span></span>
-          <button class="btn sm" onclick="departOne('${esc(r.id)}','${esc(a.id)}')" ${off ? `disabled title="${esc(why)}"` : ''}>派遣</button>
+          <button class="btn sm" data-act="depart" data-region="${esc(r.id)}" data-id="${esc(a.id)}" ${off ? `disabled title="${esc(why)}"` : ''}>派遣</button>
         </div>`
       }).join('')}
     </div>
     <div class="btn-row" style="margin-top:10px">
-      <button class="btn sm brand" onclick="departAll('${esc(r.id)}')" ${anyOff || !t.enabled ? 'disabled title="部分账号今日已派，或自动派遣已暂停"' : ''}>全部派遣</button>
+      <button class="btn sm brand" data-act="depart-all" data-region="${esc(r.id)}" ${anyOff || !t.enabled ? 'disabled title="部分账号今日已派，或自动派遣已暂停"' : ''}>全部派遣</button>
     </div>`
 }
 
@@ -815,9 +834,9 @@ function accountCard(r) {
   const a = authOf(r)
   const models = Array.isArray(r.models) ? r.models.length : (r.models ?? '—')
   return `<div class="card">
-    <div class="card-title">${a.badge}${esc(r.provider)} <span class="pill">${esc(r.label)}</span><span class="right num">:${r.port}</span></div>
+    <div class="card-title">${a.badge}${esc(r.provider)} <span class="pill">${esc(r.label)}</span><span class="right num">:${n(r.port)}</span></div>
     ${a.text ? `<div class="row" ${a.full ? `title="${esc(a.full)}"` : ''}><span class="k">账号</span><span class="v">${esc(a.text)}</span></div>` : ''}
-    <div class="row"><span class="k">可用模型</span><span class="v num">${models}</span></div>
+    <div class="row"><span class="k">可用模型</span><span class="v num">${modelCount(models)}</span></div>
     ${signinHtml(r)}
     ${travelHtml(r)}
   </div>`
@@ -842,15 +861,15 @@ function renderCredits() {
     const c = DATA.wbCredits
     html += `<div class="card">
       <div class="card-title"><span class="dot"></span>WorkBuddy 积分<span class="right">分区域 · 去重</span></div>
-      <div class="row"><span class="k">合计</span><span class="v"><b class="num" style="font-size:22px;color:var(--brand)">${c.total ?? 0} 分</b></span></div>
+      <div class="row"><span class="k">合计</span><span class="v"><b class="num" style="font-size:22px;color:var(--brand)">${n(c.total)} 分</b></span></div>
     `
     for (const g of (c.groups || [])) {
-      html += `<div class="sect-title">${esc(g.label)}<span class="num">${g.total ?? 0} 分</span></div>
+      html += `<div class="sect-title">${esc(g.label)}<span class="num">${n(g.total)} 分</span></div>
         <div class="acct-list">
           ${(g.entries || []).map(e => `<div class="acct">
             <span class="nm">${esc(e.account || e.label || '(未识别)')}</span>
-            <span class="meta tiny">:${e.port}${e.packages ? ' · ' + e.packages + ' 个额度包' : ''}</span>
-            <span class="pts num">${e.total === undefined ? '<span class="tiny" title="' + esc(e.error || '') + '">不可用</span>' : e.total + ' 分'}</span>
+            <span class="meta tiny">:${n(e.port)}${n(e.packages) ? ' · ' + n(e.packages) + ' 个额度包' : ''}</span>
+            <span class="pts num">${e.total === undefined ? '<span class="tiny" title="' + esc(e.error || '') + '">不可用</span>' : n(e.total) + ' 分'}</span>
           </div>`).join('')}
         </div>`
     }
@@ -867,7 +886,7 @@ function renderCredits() {
     const pct = t.ratio === undefined ? 0 : t.ratio
     const color = pct > 0.9 ? 'var(--red)' : pct > 0.7 ? 'var(--amber)' : 'var(--green)'
     html += `<div class="card">
-      <div class="card-title"><span class="dot" style="background:var(--brand-2)"></span>Trae 额度<span class="right num">国内 · :${t.port}</span></div>
+      <div class="card-title"><span class="dot" style="background:var(--brand-2)"></span>Trae 额度<span class="right num">国内 · :${n(t.port)}</span></div>
       <div class="row"><span class="k">剩余</span><span class="v"><b class="num" style="font-size:22px">${num(t.remaining)} 分</b></span></div>
       <div class="row"><span class="k">已用 / 总额</span><span class="v num">${num(t.consumed)} / ${num(t.total)}（${(pct * 100).toFixed(1)}%）</span></div>
       <div style="height:8px;border-radius:6px;background:#eef0f8;overflow:hidden;margin-top:8px">
@@ -918,7 +937,7 @@ function renderServices() {
     <div class="acct-list">
       ${svcs.map(s => `<div class="acct">
         <span class="nm">${esc(s.id)}</span>
-        <span class="meta tiny num">127.0.0.1:${s.port}</span>
+        <span class="meta tiny num">127.0.0.1:${n(s.port)}</span>
         <span class="v">${s.running ? '<span class="badge ok">' + ICON.ok + '运行中</span>' : '<span class="badge err">' + ICON.err + '未运行</span>'}</span>
       </div>`).join('') || '<div class="empty">暂无数据</div>'}
     </div>
@@ -976,6 +995,31 @@ function goTab(name) {
   if (name === 'services') void loadUpdates(false)
 }
 document.querySelectorAll('.nav button').forEach(b => b.addEventListener('click', () => goTab(b.dataset.tab)))
+
+/**
+ * 账号区按钮的事件委托。
+ *
+ * 之前这些按钮用 inline `onclick="departOne('${esc(a.id)}')"`。
+ * 那个写法是**真的无效**：HTML 解析器会先把属性值里的 `&#39;` 还原成 `'`，
+ * JS 引擎拿到的已经是带裸引号的源码，esc() 等于没做——只要账号 id 里出现
+ * 一个单引号就能跳出字符串字面量。而账号 id 来自 `state/accounts.json`
+ * 的 `key` 字段，那里只校验了 `typeof === 'string'`（该文件的设计用途就是
+ * 兼容导入 wb-switch 的账号库）。
+ *
+ * 改用 data-* 属性后，esc() 处在它本该在的**属性上下文**里，语义正确；
+ * 顺带也不再往 HTML 里插 JS 源码。
+ */
+document.addEventListener('click', ev => {
+  const btn = ev.target instanceof Element ? ev.target.closest('[data-act]') : null
+  if (!btn || btn.disabled) return
+  const region = btn.getAttribute('data-region') || ''
+  switch (btn.getAttribute('data-act')) {
+    case 'claim': void claimOne(region); break
+    case 'dispatch': void setDispatch(region, btn.getAttribute('data-on') === 'true'); break
+    case 'depart': void departOne(region, btn.getAttribute('data-id') || ''); break
+    case 'depart-all': void departAll(region); break
+  }
+})
 
 /* ================= 数据拉取 ================= */
 let refreshInFlight = false
