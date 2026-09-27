@@ -176,13 +176,20 @@ async function readKeyDir(dirName: string): Promise<string[]> {
   }
 }
 
-async function fetchJson(url: string, key?: string, method = 'GET', timeoutMs = 20000): Promise<{ ok: boolean; status?: number; data?: unknown; error?: string }> {
+async function fetchJson(
+  url: string,
+  key?: string,
+  method = 'GET',
+  timeoutMs = 20000,
+  body?: string,
+): Promise<{ ok: boolean; status?: number; data?: unknown; error?: string }> {
   try {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (key !== undefined && key !== '') headers['Authorization'] = `Bearer ${key}`
     const res = await fetch(url, {
       method,
       headers,
+      ...(body === undefined ? {} : { body }),
       signal: AbortSignal.timeout(timeoutMs),
     })
     const text = await res.text()
@@ -460,12 +467,20 @@ async function overview(): Promise<unknown> {
       const s = await fetchJson(`http://${HOST}:${def.port}/signin/status`, key)
       signin = s.ok ? s.data : { error: s.error ?? `HTTP ${s.status}` }
     }
+    // 旅行视图：workbuddy 专有。workbuddy-proxy 未升级时端点返回 404，
+    // 此时优雅降级为 travel: null（面板隐藏旅行区块），而不是整块报错。
+    let travel: unknown = null
+    if (def.provider === 'WorkBuddy') {
+      const t = await fetchJson(`http://${HOST}:${def.port}/travel/status`, key)
+      travel = t.ok ? t.data : null
+    }
     return {
       ...def,
       running: true,
       auth: status.ok ? (status.data as { auth?: unknown })?.auth ?? { state: 'unknown' } : { state: 'error', message: status.error ?? `HTTP ${status.status}` },
       models: status.ok ? (status.data as { models?: unknown })?.models : undefined,
       signin,
+      travel,
     }
   }))
   const items = settled.map(r => r.status === 'fulfilled'
@@ -508,6 +523,35 @@ async function claim(id: string): Promise<{ ok: boolean; status?: number; data?:
   if (!key) return { ok: false, error: '该区域缺少 key' }
   const res = await fetchJson(`http://${HOST}:${def.port}/signin/claim`, key, 'POST', 40000)
   return { ok: res.ok, status: res.status, data: res.data, error: res.error }
+}
+
+/**
+ * 手动派遣。
+ *
+ * 并发锁：连点「全部派遣」时只放行一次，其余立刻回 409，不排队。
+ * 不做二次确认——派遣可逆（服务端 daily_limit 每天只给一次机会）且收益为正，
+ * 与 /api/update/apply 那种高危不可逆操作不是一个量级。
+ */
+let travelDepartInFlight = false
+async function travelDepart(
+  regionId: string,
+  accountId?: string,
+): Promise<{ ok: boolean; status?: number; data?: unknown; error?: string }> {
+  if (travelDepartInFlight) return { ok: false, status: 409, error: '已有派遣请求在处理中，请稍候' }
+  const def = REGIONS.find(r => r.id === regionId)
+  if (!def) return { ok: false, error: `未知区域：${regionId}` }
+  if (def.provider !== 'WorkBuddy') return { ok: false, error: '仅 WorkBuddy 支持派遣' }
+  const key = await readRegionKey(def.keyName)
+  if (!key) return { ok: false, error: '该区域缺少 key' }
+  travelDepartInFlight = true
+  try {
+    const body = accountId === undefined || accountId === '' ? '{}' : JSON.stringify({ id: accountId })
+    // 内部会按账号错开 2 秒依次派出，最坏 3 个账号约十几秒，给足超时。
+    const res = await fetchJson(`http://${HOST}:${def.port}/travel/depart`, key, 'POST', 90000, body)
+    return { ok: res.ok, status: res.status, data: res.data, error: res.error }
+  } finally {
+    travelDepartInFlight = false
+  }
 }
 
 function hostIsLoopback(host: string | undefined): boolean {
@@ -641,6 +685,23 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       if (!id) { res.writeHead(400); res.end(JSON.stringify({ error: '缺少 id' })); return }
       const result = await claim(id)
       res.writeHead(result.ok ? 200 : 502, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(result)); return
+    }
+    if (req.method === 'POST' && url === '/api/travel/depart') {
+      const body = await readBody(req)
+      if (!body.ok) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: '请求体过大' })); return }
+      // region 必填；accountId 可省略（省略 = 该区域所有可派账号各派一次）
+      let regionId = ''
+      let accountId: string | undefined
+      try {
+        const parsed = JSON.parse(body.text || '{}') as { region?: unknown; id?: unknown }
+        if (typeof parsed.region === 'string') regionId = parsed.region
+        if (typeof parsed.id === 'string' && parsed.id !== '') accountId = parsed.id
+      } catch { /* 解析失败按缺少 region 处理 */ }
+      if (!regionId) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: '缺少 region' })); return }
+      const result = await travelDepart(regionId, accountId)
+      // 409 表示并发占用，如实透传状态码让前端能区分「忙」与「失败」
+      res.writeHead(result.status === 409 ? 409 : result.ok ? 200 : 502, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(result)); return
     }
     if (req.method === 'GET' && url === '/api/update/check') {

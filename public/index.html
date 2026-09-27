@@ -97,6 +97,13 @@ async function api(path, method = 'GET', body) {
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])) }
 
+/** 错误文案只留首句并限长，避免撑爆卡片；完整内容放在 title 里 hover 可看。 */
+function brief(msg, max = 60) {
+  const s = String(msg)
+  const head = s.split(/[；;。]/)[0]
+  return head.length > max ? head.slice(0, max) + '…' : head
+}
+
 function authOf(r) {
   const a = r.auth || {}
   if (r.running === false) return { cls: 'off', text: '服务未运行' }
@@ -104,12 +111,15 @@ function authOf(r) {
   if (a.state === 'expired') return { cls: 'warn', text: 'token 已过期' }
   if (a.state === 'signed-out') return { cls: 'off', text: '未登录' }
   if (a.state === 'no-key') return { cls: 'warn', text: '缺 key（首次启动后重试）' }
-  return { cls: 'err', text: esc(a.message || a.state || '未知') }
+  // 兜底截断：代理的错误文案有可能很长（曾经把整张卡片撑爆过一次），
+  // 面板上只留首句，完整内容放 title 里 hover 可看。
+  const msg = String(a.message || a.state || '未知')
+  return { cls: 'err', text: esc(brief(msg)), full: esc(msg) }
 }
 
 function signinHtml(r) {
   if (!r.signin) return '<div class="row muted">签到：不可用</div>'
-  if (r.signin.error) return '<div class="row muted">签到：' + esc(r.signin.error) + '</div>'
+  if (r.signin.error) return '<div class="row muted" title="' + esc(r.signin.error) + '">签到：' + esc(brief(r.signin.error)) + '</div>'
   const s = r.signin
   // 三种代理字段不同，这里做归一
   const raw = s.view || {}
@@ -136,6 +146,118 @@ function signinHtml(r) {
     </div>`
 }
 
+// ---- 派猫猫旅行 ----
+
+/**
+ * 把「距到达」渲染成可读时长。
+ *
+ * 关键：用 arriveAt 与 serverNow 的**差值**算，而不是把 arriveAt 当本机时间戳——
+ * 服务端的时间基准未必与浏览器一致。前端只算一次并本地递减（见 tickTravelCountdowns）。
+ */
+function travelRemaining(a) {
+  if (!a.arriveAt || !a.serverNow) return ''
+  const sec = a.arriveAt - a.serverNow
+  if (sec <= 0) return '已到达'
+  const m = Math.ceil(sec / 60)
+  if (m < 60) return '剩 ' + m + ' 分钟'
+  const h = Math.floor(m / 60)
+  const rest = m % 60
+  return '剩 ' + h + ' 小时' + (rest ? ' ' + rest + ' 分' : '')
+}
+
+/** 四态徽标：旅行中 / 今日已派 / 刚领到 / 无 Buddy。 */
+function travelBadge(a) {
+  const justClaimed = a.claimedAtMs && (Date.now() - a.claimedAtMs) < 3600_000 && a.claimedCredit > 0
+  if (justClaimed) {
+    return '<span class="dot ok"></span> 刚领到 +' + a.claimedCredit + ' 积分'
+  }
+  if (a.state === 'traveling' || a.state === 'arrived') {
+    const left = travelRemaining(a)
+    return '<span class="dot warn"></span> 旅行中' + (a.locationName ? '·' + esc(a.locationName) : '') +
+      (left ? '（' + left + '）' : '')
+  }
+  if (a.doneReason === 'no-buddy') return '<span class="dot off"></span> 无 Buddy'
+  if (a.doneReason === 'window') return '<span class="dot off"></span> 不在可派时段'
+  if (a.done) return '<span class="dot ok"></span> 今日已派'
+  return '<span class="dot warn"></span> 待派遣'
+}
+
+function travelHtml(r) {
+  // workbuddy-proxy 未升级时端点 404，overview 里 travel 为 null → 整块隐藏。
+  if (r.travel === null || r.travel === undefined) return ''
+  const list = Array.isArray(r.travel.accounts) ? r.travel.accounts : []
+  if (list.length === 0) {
+    // 该区域没有旅行目标。国际版天生如此（成长中心只有国内版），
+    // 显式说明而不是静默隐藏，省掉一个「怎么没有」的疑问。
+    // region 由 travel 载荷自带（代理按端口区域过滤后回传），不靠 id 猜。
+    const why = r.travel.region === 'global' ? '国际版无此活动' : '暂无国内版账号'
+    return '<div class="signin-box"><div class="row"><span class="k">派猫猫旅行</span>' +
+      '<span class="muted">' + esc(why) + '</span></div></div>'
+  }
+  const win = r.travel.window || {}
+  const rows = list.map(a => {
+    // 把服务端的「差值」换算成本地绝对落地点，之后前端自己递减，无需再问后端。
+    const deltaSec = (a.arriveAt && a.serverNow) ? (a.arriveAt - a.serverNow) : 0
+    const deadline = deltaSec > 0 ? Date.now() + deltaSec * 1000 : 0
+    return `
+    <div class="row">
+      <span class="k">${esc(a.label)}</span>
+      <span>${travelBadge(a)}</span>
+      <span class="muted" data-travel-remain="${deadline}">${a.state === 'traveling' ? travelRemaining(a) : ''}</span>
+      <button onclick="departOne('${esc(r.id)}','${esc(a.id)}')">立即派遣</button>
+    </div>`
+  }).join('')
+  return `
+    <div class="signin-box">
+      <div class="row"><span class="k">可派时段</span><span class="muted">${win.startHour ?? 8}:00–${win.endHour ?? 23}:00（窗外不派，领取不受影响）</span></div>
+      ${rows}
+      <div class="row" style="margin-top:8px">
+        <span></span>
+        <button class="primary" onclick="departAll('${esc(r.id)}')">全部派遣</button>
+      </div>
+    </div>`
+}
+
+/**
+ * 本地递减倒计时：每 30 秒刷新一次显示，不产生任何后端请求。
+ * data-travel-remain 存的是「本地绝对落地点」，由渲染时的服务端差值换算而来。
+ */
+function tickTravelCountdowns() {
+  document.querySelectorAll('[data-travel-remain]').forEach(el => {
+    const deadline = Number(el.getAttribute('data-travel-remain') || '0')
+    if (!deadline) { el.textContent = ''; return }
+    const sec = Math.round((deadline - Date.now()) / 1000)
+    if (sec <= 0) { el.textContent = '已到达，等待领取'; return }
+    const m = Math.ceil(sec / 60)
+    el.textContent = m < 60 ? ('剩 ' + m + ' 分钟') : ('剩 ' + Math.floor(m / 60) + ' 小时' + (m % 60 ? ' ' + (m % 60) + ' 分' : ''))
+  })
+}
+
+async function departOne(region, id) {
+  try {
+    const r = await api('/api/travel/depart', 'POST', { region, id })
+    showDepartResults(r, '派遣结果')
+  } catch (e) { toast('派遣失败：' + e.message, 'err') }
+  await refresh()
+}
+
+async function departAll(region) {
+  try {
+    const r = await api('/api/travel/depart', 'POST', { region })
+    showDepartResults(r, '全部派遣结果')
+  } catch (e) { toast('派遣失败：' + e.message, 'err') }
+  await refresh()
+}
+
+function showDepartResults(r, title) {
+  if (r && r.status === 409) { toast('已有派遣在处理中，请稍候', 'err'); return }
+  const results = r && r.data && r.data.results
+  if (!Array.isArray(results)) { toast((r && r.error) || '派遣无返回', 'err'); return }
+  const lines = results.map(x => x.label + '：' + x.message)
+  const anyOk = results.some(x => x.ok)
+  toast(title + '\n' + lines.join('\n'), anyOk ? 'ok' : 'err')
+}
+
 function card(r) {
   const a = authOf(r)
   const models = Array.isArray(r.models) ? r.models.length : (r.models ?? '-')
@@ -143,9 +265,10 @@ function card(r) {
     <div class="card">
       <h2><span class="dot ${a.cls}"></span> ${esc(r.provider)} <span class="tag">${esc(r.label)}</span></h2>
       <div class="muted" style="margin-bottom:10px">端口 ${r.port}</div>
-      <div class="row"><span class="k">账号</span><span>${a.text}</span></div>
+      <div class="row" ${a.full ? `title="${a.full}"` : ''}><span class="k">账号</span><span>${a.text}</span></div>
       <div class="row"><span class="k">模型数</span><span>${models}</span></div>
       ${signinHtml(r)}
+      ${travelHtml(r)}
     </div>`
 }
 
@@ -248,14 +371,20 @@ async function claimAll() {
 const REFRESH_MS = 15 * 60 * 1000
 const VISIBILITY_MIN_GAP_MS = 60 * 1000
 let refreshTimer = null
+let countdownTimer = null
 
 function startAutoRefresh() {
   if (refreshTimer !== null) return
   refreshTimer = setInterval(() => { if (!document.hidden) refresh() }, REFRESH_MS)
+  // 倒计时纯本地递减，30 秒一次足够，且完全不产生后端请求。
+  if (countdownTimer === null) {
+    countdownTimer = setInterval(() => { if (!document.hidden) tickTravelCountdowns() }, 30 * 1000)
+  }
 }
 
 function stopAutoRefresh() {
   if (refreshTimer !== null) { clearInterval(refreshTimer); refreshTimer = null }
+  if (countdownTimer !== null) { clearInterval(countdownTimer); countdownTimer = null }
 }
 
 document.addEventListener('visibilitychange', () => {
