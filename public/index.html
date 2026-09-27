@@ -224,6 +224,20 @@ function travelHtml(r) {
       '<span class="muted">' + esc(why) + '</span></div></div>'
   }
   const win = r.travel.window || {}
+  // 派遣总开关。关掉只停「新派遣」，在途行程仍会到点自动领取。
+  const on = r.travel.dispatchEnabled !== false
+  const toggle = `
+    <div class="row">
+      <span class="k">自动派遣</span>
+      <span>${on
+        ? '<span class="dot ok"></span> 已开启'
+        : '<span class="dot off"></span> 已暂停（在途仍领取）'}</span>
+      <span>
+        <button onclick="setDispatch('${esc(r.id)}',${on ? 'false' : 'true'})" id="tg-${esc(r.id)}">
+          ${on ? '暂停' : '开启'}
+        </button>
+      </span>
+    </div>`
   // 服务端实测：每账号每天只能派 1 次，领取后不重置。所以「已派/已领」的账号
   // 直接把按钮置灰并说明原因——否则用户点了只会看到「达到上限」，
   // 以为按钮坏了。（每日额度由代理在可派时段内自动用掉，无需手动。）
@@ -250,13 +264,27 @@ function travelHtml(r) {
   const anyOff = list.some(notDispatchable)
   return `
     <div class="signin-box">
+      ${toggle}
       <div class="row"><span class="k">可派时段</span><span class="muted">${win.startHour ?? 8}:00–${win.endHour ?? 23}:00 · 每账号每天 1 次，代理自动完成</span></div>
       ${rows}
       <div class="row" style="margin-top:8px">
         <span></span>
-        <button class="primary" onclick="departAll('${esc(r.id)}')" ${anyOff ? 'disabled title="部分账号今日已派"' : ''}>全部派遣</button>
+        <button class="primary" onclick="departAll('${esc(r.id)}')" ${anyOff || !on ? 'disabled title="部分账号今日已派，或自动派遣已暂停"' : ''}>全部派遣</button>
       </div>
     </div>`
+}
+
+/** 切换自动派遣总开关。 */
+async function setDispatch(region, on) {
+  const btn = document.getElementById('tg-' + region)
+  if (btn) { btn.disabled = true; btn.textContent = '处理中…' }
+  try {
+    const r = await api('/api/travel/enable', 'POST', { region, enabled: on })
+    toast(on ? '已开启自动派遣' : '已暂停自动派遣（在途行程仍会照常领取）', on ? 'ok' : '')
+  } catch (e) {
+    toast('切换失败：' + e.message, 'err')
+  }
+  await refresh()
 }
 
 /**

@@ -501,6 +501,16 @@ const OVERVIEW_TTL_MS = 30 * 1000
 let overviewCache: { at: number; data: unknown } | null = null
 let overviewInFlight: Promise<unknown> | null = null
 
+/**
+ * 作废 overview 缓存。
+ *
+ * 任何**改变状态**的操作都要调它——否则 30 秒 TTL 内前端刷新拿到的还是旧值，
+ * 表现为「点了开关，按钮却像没反应」。派遣开关就是这个问题。
+ */
+function invalidateOverview(): void {
+  overviewCache = null
+}
+
 async function overviewCached(): Promise<unknown> {
   if (overviewCache !== null && Date.now() - overviewCache.at < OVERVIEW_TTL_MS) {
     return overviewCache.data
@@ -533,6 +543,30 @@ async function claim(id: string): Promise<{ ok: boolean; status?: number; data?:
  * 与 /api/update/apply 那种高危不可逆操作不是一个量级。
  */
 let travelDepartInFlight = false
+
+/**
+ * 切换自动派遣总开关。
+ *
+ * 语义（用户明确要求）：关掉只停「新派遣」，**已经在途的仍会到点自动领取**——
+ * 手动关一下不该把已赚的积分丢掉。开关状态由代理落盘，重启后保持。
+ */
+async function travelEnable(
+  regionId: string,
+  enabled: boolean,
+): Promise<{ ok: boolean; status?: number; data?: unknown; error?: string }> {
+  const def = REGIONS.find(r => r.id === regionId)
+  if (!def) return { ok: false, error: `未知区域：${regionId}` }
+  if (def.provider !== 'WorkBuddy') return { ok: false, error: '仅 WorkBuddy 支持旅行派遣' }
+  const key = await readRegionKey(def.keyName)
+  if (!key) return { ok: false, error: '该区域缺少 key' }
+  const res = await fetchJson(
+    `http://${HOST}:${def.port}/travel/enable`, key, 'POST', 20000, JSON.stringify({ enabled }),
+  )
+  // 状态变了，作废缓存，让前端紧接着的 refresh 拿到新值
+  if (res.ok) invalidateOverview()
+  return { ok: res.ok, status: res.status, data: res.data, error: res.error }
+}
+
 async function travelDepart(
   regionId: string,
   accountId?: string,
@@ -548,6 +582,7 @@ async function travelDepart(
     const body = accountId === undefined || accountId === '' ? '{}' : JSON.stringify({ id: accountId })
     // 内部会按账号错开 2 秒依次派出，最坏 3 个账号约十几秒，给足超时。
     const res = await fetchJson(`http://${HOST}:${def.port}/travel/depart`, key, 'POST', 90000, body)
+    if (res.ok) invalidateOverview()
     return { ok: res.ok, status: res.status, data: res.data, error: res.error }
   } finally {
     travelDepartInFlight = false
@@ -702,6 +737,22 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const result = await travelDepart(regionId, accountId)
       // 409 表示并发占用，如实透传状态码让前端能区分「忙」与「失败」
       res.writeHead(result.status === 409 ? 409 : result.ok ? 200 : 502, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(result)); return
+    }
+    if (req.method === 'POST' && url === '/api/travel/enable') {
+      const body = await readBody(req)
+      if (!body.ok) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: '请求体过大' })); return }
+      let regionId = ''
+      let enabled = true
+      try {
+        const parsed = JSON.parse(body.text || '{}') as { region?: unknown; enabled?: unknown }
+        if (typeof parsed.region === 'string') regionId = parsed.region
+        // 缺省视为「开启」；只接受布尔值，不猜。
+        if (typeof parsed.enabled === 'boolean') enabled = parsed.enabled
+      } catch { /* 按缺省处理 */ }
+      if (!regionId) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: '缺少 region' })); return }
+      const result = await travelEnable(regionId, enabled)
+      res.writeHead(result.ok ? 200 : 502, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(result)); return
     }
     if (req.method === 'GET' && url === '/api/update/check') {
