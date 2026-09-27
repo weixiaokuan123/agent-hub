@@ -21,6 +21,7 @@ import type { Socket } from 'node:net'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AGENT_HUB_VERSION } from './version.ts'
+import { createToolRouter } from './tool-api.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
@@ -672,6 +673,19 @@ async function serveIndex(res: ServerResponse): Promise<void> {
   }
 }
 
+/** tool.html 同样内存缓存；改完重启生效，与面板一致。 */
+let toolHtmlCache: string | null = null
+
+async function serveTool(res: ServerResponse): Promise<void> {
+  try {
+    if (toolHtmlCache === null) toolHtmlCache = await readFile(join(PUBLIC_DIR, 'tool.html'), 'utf8')
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+    res.end(toolHtmlCache)
+  } catch {
+    res.writeHead(500); res.end('缺少 tool.html')
+  }
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   applySecurityHeaders(res)
   const url = (req.url ?? '/').split('?')[0] ?? '/'
@@ -681,6 +695,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // index 页面在浏览器直接访问时会带 key（?key=），便于拿到后写入 localStorage
   if (req.method === 'GET' && (url === '/' || url === '/index.html')) {
     await serveIndex(res)
+    return
+  }
+  // 工具台页面：与面板同为单文件，但独立存放，互不干扰。
+  // 注意它**不需要**鉴权——是个壳，数据全靠 /tool/api/*（那些要鉴权）。
+  // 若这里也要求 key，浏览器直接输 URL 就进不去了。CSP 已限制它只能同源请求。
+  if (req.method === 'GET' && url === '/tool') {
+    await serveTool(res)
     return
   }
   if (req.method === 'GET' && url === '/healthz') {
@@ -693,6 +714,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   try {
+    // 工具台的接口面。放在鉴权之后，所以 /tool/api/* 自动受 hub-key 保护。
+    // 认领制：不是 /tool/api 开头的路径会立刻返回 false，继续往下走原路由链。
+    if (await toolRouter(req, res, url)) return
+
     if (req.method === 'GET' && url === '/api/overview') {
       const data = await overviewCached()
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
@@ -837,8 +862,15 @@ function readBody(req: IncomingMessage): Promise<BodyResult> {
 }
 
 
+/**
+ * 工具台的路由实例。在 main() 里初始化——因为它的依赖（authed）读的是
+ * main() 阶段才载入的 HUB_KEY，提前建会在 key 还是空串时把 authed 闭包定死。
+ */
+let toolRouter: (req: IncomingMessage, res: ServerResponse, url: string) => Promise<boolean>
+
 async function main(): Promise<void> {
   HUB_KEY = await loadOrCreateHubKey()
+  toolRouter = createToolRouter({ authed, log })
   const sockets = new Set<Socket>()
   const server: Server = createServer((req, res) => { void handle(req, res) })
   server.on('connection', s => { sockets.add(s); s.once('close', () => sockets.delete(s)) })
