@@ -375,11 +375,42 @@ const ICON = {
 let DATA = { overview: null, wbCredits: null, traeCredits: null, services: null, updates: null }
 
 /* ================= 账号状态 ================= */
+/**
+ * 桌面端「当前登录」槽位。服务端用 id 区分两类目标：
+ *   live-cn / live-global      → 桌面端当前登录的那个号
+ *   acct:switch:<uuid>         → 账号库里的独立账号
+ * 两者在 /signin/status 里混在同一个 targets 数组返回。
+ */
+function isLiveSlot(t) {
+  return typeof t.id === 'string' && t.id.startsWith('live-')
+}
+
+/** 服务端已经给过结论（lastResult 非空）——再点也不会变好。 */
+function hasVerdict(t) {
+  return typeof t.lastResult === 'string' && t.lastResult.trim() !== ''
+}
+
 function authOf(r) {
   const a = r.auth || {}
   if (r.running === false) return { kind: 'err', badge: '<span class="badge err">' + ICON.err + '未运行</span>' }
   if (a.state === 'signed-in') return { kind: 'ok', badge: '<span class="badge ok">' + ICON.ok + '已登录</span>', text: a.account || a.uin || '' }
-  if (a.state === 'expired') return { kind: 'warn', badge: '<span class="badge off">' + ICON.warn + 'token 过期</span>' }
+  // 凭据本身不可用，但账号库里有账号正在服务这个区域 —— 那就是**实际能用**。
+  // 按用户要求：能正常读取就不强调凭据的事，不报未登录、也不把原因摊开。
+  if (r.provider === 'WorkBuddy') {
+    const backed = poolBacksRegion(r)
+    if (backed > 0) {
+      return {
+        kind: 'ok',
+        badge: '<span class="badge ok">' + ICON.ok + '可用</span>',
+        text: '账号库 ' + backed + ' 个账号',
+      }
+    }
+    // 积分数据没取到就无法判断账号库是否在顶替，此时报「未登录」是不负责任的。
+    if (DATA.wbCredits === null) {
+      return { kind: 'off', badge: '<span class="badge off">' + ICON.off + '状态未知</span>', text: '积分数据暂不可用，无法判断账号库是否已接管' }
+    }
+  }
+  if (a.state === 'expired') return { kind: 'warn', badge: '<span class="badge off">' + ICON.warn + 'token 过期</span>', text: brief(a.message || ''), full: a.message || '' }
   if (a.state === 'signed-out') return { kind: 'off', badge: '<span class="badge off">' + ICON.off + '未登录</span>' }
   if (a.state === 'no-key') return { kind: 'warn', badge: '<span class="badge off">' + ICON.warn + '缺 key</span>' }
   const msg = a.message || a.state || '未知'
@@ -397,7 +428,13 @@ function authOf(r) {
 function signinStats(r) {
   const s = r.signin
   if (!s) return null
-  const targets = Array.isArray(s.targets) ? s.targets : []
+  const raw = Array.isArray(s.targets) ? s.targets : []
+  // 桌面端「当前登录」槽位（id 形如 live-cn / live-global）不是账号库里可独立
+  // 签到的账号：要么已被同身份账号顶替，要么该账号压根没开签到活动。
+  // 服务端一旦对它给出结论（lastResult 非空）就整条去掉，不再在面板上占位——
+  // 否则每天都会显示「失败：登录态 token 已加密…」，而这恰恰是**不影响使用**的事。
+  // 还没试过的（lastResult 为空）仍然保留，万一它真能领，漏掉才是问题。
+  const targets = raw.filter(t => !isLiveSlot(t) || !hasVerdict(t))
   if (targets.length > 0) {
     const done = targets.filter(t => t.claimedToday).length
     return { done, total: targets.length, targets }
@@ -505,7 +542,7 @@ function poolBacksRegion(r) {
 
 /** 未领取且服务端已给出结论的目标——再点也不会变好，只能作为说明展示。 */
 function isBlocked(t) {
-  return t.claimedToday !== true && typeof t.lastResult === 'string' && t.lastResult !== ''
+  return t.claimedToday !== true && hasVerdict(t)
 }
 
 /**
