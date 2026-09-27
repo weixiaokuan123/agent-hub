@@ -119,12 +119,39 @@ function authOf(r) {
 
 function signinHtml(r) {
   if (!r.signin) return '<div class="row muted">签到：不可用</div>'
-  if (r.signin.error) return '<div class="row muted" title="' + esc(r.signin.error) + '">签到：' + esc(brief(r.signin.error)) + '</div>'
   const s = r.signin
-  // 三种代理字段不同，这里做归一
+  // 逐目标明细优先。代理侧一个区域可能对应多个签到账号（本端口自身 + 账号库），
+  // 只显示本端口会把「某个入口坏了」误报成「签到坏了」。
+  const targets = Array.isArray(s.targets) ? s.targets : []
+  const claimedCount = typeof s.claimedCount === 'number'
+    ? s.claimedCount
+    : targets.filter(t => t.claimedToday).length
+
+  if (targets.length > 0) {
+    const rows = targets.map(t => {
+      const badge = t.claimedToday
+        ? '<span class="dot ok"></span> 已领'
+        : '<span class="dot warn"></span> 待领'
+      const when = t.claimedToday ? esc(t.lastResult || '已领取') : ('计划 ' + esc(t.scheduledAt || '-'))
+      return `<div class="row"><span class="k">${esc(t.label)}</span><span>${badge}</span>` +
+        `<span class="muted">${when}</span></div>`
+    }).join('')
+    const allDone = claimedCount >= targets.length
+    return `
+    <div class="signin-box">
+      <div class="row"><span class="k">今日签到</span><span>${claimedCount} / ${targets.length} 已领</span></div>
+      ${rows}
+      <div class="row" style="margin-top:8px">
+        <span></span>
+        <button onclick="claim('${esc(r.id)}')" ${allDone ? 'disabled' : ''}>立即签到</button>
+      </div>
+    </div>`
+  }
+
+  // 无明细（其它代理或旧版 workbuddy-proxy）：退回单账号视图。
+  if (s.error) return '<div class="row muted" title="' + esc(s.error) + '">签到：' + esc(brief(s.error)) + '</div>'
   const raw = s.view || {}
   const nest = raw.panel || {}          // MiniMax: view.panel.{checkedInToday,streak,todayPoints}
-  const inner = raw.panel?.panel || {}
   const checkedIn = raw.checkedIn === true || raw.todayCheckedIn === true || nest.checkedInToday === true
   const enabled = raw.enabled !== false && raw.active !== false
   const credits = raw.credits ?? raw.todayCredit ?? nest.todayPoints ?? 0
@@ -178,6 +205,8 @@ function travelBadge(a) {
   }
   if (a.doneReason === 'no-buddy') return '<span class="dot off"></span> 无 Buddy'
   if (a.doneReason === 'window') return '<span class="dot off"></span> 不在可派时段'
+  if (a.doneReason === 'claimed') return '<span class="dot ok"></span> 今日已领'
+  if (a.doneReason === 'daily-limit') return '<span class="dot ok"></span> 今日已派'
   if (a.done) return '<span class="dot ok"></span> 今日已派'
   return '<span class="dot warn"></span> 待派遣'
 }
@@ -195,25 +224,37 @@ function travelHtml(r) {
       '<span class="muted">' + esc(why) + '</span></div></div>'
   }
   const win = r.travel.window || {}
+  // 服务端实测：每账号每天只能派 1 次，领取后不重置。所以「已派/已领」的账号
+  // 直接把按钮置灰并说明原因——否则用户点了只会看到「达到上限」，
+  // 以为按钮坏了。（每日额度由代理在可派时段内自动用掉，无需手动。）
+  const notDispatchable = a => a.done === true || a.state === 'traveling' || a.state === 'arrived'
   const rows = list.map(a => {
     // 把服务端的「差值」换算成本地绝对落地点，之后前端自己递减，无需再问后端。
     const deltaSec = (a.arriveAt && a.serverNow) ? (a.arriveAt - a.serverNow) : 0
     const deadline = deltaSec > 0 ? Date.now() + deltaSec * 1000 : 0
+    const off = notDispatchable(a)
+    const why = a.doneReason === 'no-buddy' ? '无 Buddy'
+      : a.doneReason === 'claimed' ? '今日已领，明日再来'
+      : a.doneReason === 'daily-limit' ? '今日已派，明日再来'
+      : a.doneReason === 'window' ? '不在可派时段'
+      : a.state === 'traveling' || a.state === 'arrived' ? '旅行中'
+      : '今日已派'
     return `
     <div class="row">
       <span class="k">${esc(a.label)}</span>
       <span>${travelBadge(a)}</span>
-      <span class="muted" data-travel-remain="${deadline}">${a.state === 'traveling' ? travelRemaining(a) : ''}</span>
-      <button onclick="departOne('${esc(r.id)}','${esc(a.id)}')">立即派遣</button>
+      <span class="muted" data-travel-remain="${deadline}">${a.state === 'traveling' ? travelRemaining(a) : (off ? esc(why) : '')}</span>
+      <button onclick="departOne('${esc(r.id)}','${esc(a.id)}')" ${off ? `disabled title="${esc(why)}"` : ''}>立即派遣</button>
     </div>`
   }).join('')
+  const anyOff = list.some(notDispatchable)
   return `
     <div class="signin-box">
-      <div class="row"><span class="k">可派时段</span><span class="muted">${win.startHour ?? 8}:00–${win.endHour ?? 23}:00（窗外不派，领取不受影响）</span></div>
+      <div class="row"><span class="k">可派时段</span><span class="muted">${win.startHour ?? 8}:00–${win.endHour ?? 23}:00 · 每账号每天 1 次，代理自动完成</span></div>
       ${rows}
       <div class="row" style="margin-top:8px">
         <span></span>
-        <button class="primary" onclick="departAll('${esc(r.id)}')">全部派遣</button>
+        <button class="primary" onclick="departAll('${esc(r.id)}')" ${anyOff ? 'disabled title="部分账号今日已派"' : ''}>全部派遣</button>
       </div>
     </div>`
 }
@@ -359,8 +400,15 @@ async function claim(id) {
 async function claimAll() {
   try {
     const data = await api('/api/overview')
-    const targets = data.regions.filter(r => r.signin && !r.signin.error && r.signin.view && !r.signin.view.checkedIn)
-    const ids = targets.map(t => t.id)
+    // 兼容两种形状：有逐目标明细的（新版 workbuddy-proxy）看 targets 是否全领完；
+    // 没有明细的（其它代理 / 旧版）退回单账号 view.checkedIn 判断。
+    const ids = data.regions.filter(r => {
+      if (!r.signin) return false
+      if (Array.isArray(r.signin.targets) && r.signin.targets.length > 0) {
+        return r.signin.targets.some(t => !t.claimedToday)
+      }
+      return !r.signin.error && r.signin.view && !r.signin.view.checkedIn
+    }).map(t => t.id)
     if (!ids.length) { toast('没有需要签到的平台'); return }
     for (const id of ids) { await claim(id) }
   } catch (e) { toast('批量签到失败：' + e.message, 'err') }
