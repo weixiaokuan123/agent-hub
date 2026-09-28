@@ -16,8 +16,10 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { appendFileSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
+import { isNewer } from './updater.ts'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import type { Socket } from 'node:net'
+import { Socket } from 'node:net'
+import { spawn } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AGENT_HUB_VERSION } from './version.ts'
@@ -214,6 +216,16 @@ async function fetchJson(
  *     （桌面端切号后 live 跟随），按账号标识（account / uin）去重，
  *     重复项直接丢弃，只保留 live 优先的那一条，不进入返回结果。
  */
+/** 代理透传过来的单个积分包（与 workbuddy-proxy 的 WorkBuddyCreditPackage 对应）。 */
+interface CreditPackage {
+  packageName?: string
+  remain?: number
+  size?: number
+  monthly?: boolean
+  refreshAtMs?: number
+  expiresAtMs?: number
+}
+
 interface WorkBuddyCreditEntry {
   label: string
   port: number
@@ -221,6 +233,18 @@ interface WorkBuddyCreditEntry {
   account?: string
   total?: number
   packages?: number
+  /**
+   * 逐包明细（到期 / 刷新时刻 + 剩余额度）。
+   *
+   * 代理过去只给 `packages` 一个计数，所以面板无法展示任何到期信息；
+   * 现在代理把明细一并透传，这里原样带下去，聚合由面板做。
+   * 字段缺失（连到旧版本代理）时为 undefined，面板按「无明细」降级。
+   */
+  creditPackages?: CreditPackage[]
+  /** 3 天内到期的积分数；> 0 表示有积分即将作废。 */
+  expiringSoon?: number
+  /** 最近一个包的到期时刻（ms）。 */
+  nearestExpiryMs?: number
   error?: string
 }
 
@@ -237,19 +261,123 @@ interface WorkBuddyCreditGroup {
  * 抽成纯函数以便测试：上游字段可能缺失/异常，这里逐条降级 ——
  * 某账号没有积分就带上 creditsError，而不是整块丢掉。
  */
+/**
+ * 启动后的自动更新检查：退避重试，而不是一次就放弃。
+ *
+ * 原来只有 `setTimeout(30s)` 打一枪。开机时代理往往还没监听端口，
+ * `readCurrentVersion` 于是返回 undefined，三个仓被一次性全部跳过——
+ * 而下一次检查在 24 小时后。结果就是「启动时自动更新」完全看代理启动快慢的运气，
+ * 而且失败时**没有任何痕迹**，使用者只会以为"最近没更新"。
+ *
+ * 所以这里在有限的启动窗口内重试：每轮按 results.length 判断是否三个仓都拿到了
+ * 版本号，全齐就收工；始终不齐（真没装 / 真坏了）才放弃，并且必须留下一行日志。
+ *
+ * 依赖全部注入，便于测试；不引入任何 sleep 实现细节。
+ */
+export const STARTUP_RETRY_DELAYS_MS: readonly number[] = [0, 30_000, 60_000, 120_000, 240_000]
+
+export async function startupUpdateCheck(deps: {
+  /** 执行一次检查，返回 { results } —— 只有解析出版本号的仓才会进来。 */
+  check: () => Promise<{ results?: unknown[] }>
+  /** 应当解析出的仓数（= UPDATABLE.length）。 */
+  total: number
+  delaysMs: readonly number[]
+  sleep: (ms: number) => Promise<void>
+  log: (message: string) => void
+}): Promise<{ rounds: number; gaveUp: boolean }> {
+  const { check, total, delaysMs, sleep, log } = deps
+  let resolved = 0
+  for (let round = 0; round < delaysMs.length; round++) {
+    if (delaysMs[round] > 0) await sleep(delaysMs[round])
+    try {
+      const r = await check()
+      resolved = Array.isArray(r?.results) ? r.results.length : 0
+    } catch (error) {
+      // 代理还没起来时连接被拒是常态，不该把整个重试链打断
+      resolved = 0
+      log(`更新检查第 ${round + 1} 轮未完成：${error instanceof Error ? error.message : String(error)}`)
+    }
+    if (resolved >= total) return { rounds: round + 1, gaveUp: false }
+  }
+  log(`更新检查：${total - resolved}/${total} 个代理始终未就绪，本次跳过自动更新，24 小时后再试`)
+  return { rounds: delaysMs.length, gaveUp: true }
+}
+
+/**
+ * 读 `state/update-pending.json`（后台自动合并后写的待重启标记）。
+ *
+ * 这文件从加自动更新那天起就一直有人写、**没有人读**——于是「3 个仓库已更新、
+ * 重启后生效」这件事没人知道。现在读出来交给面板显示。
+ *
+ * 解析必须全程降级：文件可能不存在、为空、被写坏（它是自动生成的），
+ * 任何一种都不该把「服务」页整个打不开。
+ */
+export function parseUpdatePending(raw: string | null | undefined): {
+  repos: string[]
+  latest: Record<string, string>
+  checkedAt?: number
+} {
+  const empty = { repos: [] as string[], latest: {} as Record<string, string> }
+  if (typeof raw !== 'string' || raw.trim() === '') return empty
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return empty
+  }
+  if (typeof parsed !== 'object' || parsed === null) return empty
+  const obj = parsed as { checkedAt?: unknown; pending?: unknown }
+  const list = Array.isArray(obj.pending) ? obj.pending : []
+  const repos: string[] = []
+  const latest: Record<string, string> = {}
+  for (const item of list) {
+    if (typeof item !== 'object' || item === null) continue
+    const name = (item as { name?: unknown }).name
+    if (typeof name !== 'string' || name === '') continue
+    repos.push(name)
+    const v = (item as { latest?: unknown }).latest
+    if (typeof v === 'string') latest[name] = v
+  }
+  return {
+    repos,
+    latest,
+    checkedAt: typeof obj.checkedAt === 'number' ? obj.checkedAt : undefined,
+  }
+}
+
 export function parsePoolEntries(
   statusData: unknown,
   port: number,
 ): WorkBuddyCreditEntry[] {
   const data = (typeof statusData === 'object' && statusData !== null ? statusData : {}) as {
-    pool?: { entries?: Array<{ label?: string; credits?: number; packages?: number; creditsError?: string }> }
+    pool?: { entries?: Array<{
+      label?: string
+      credits?: number
+      packages?: number
+      creditPackages?: unknown
+      expiringSoon?: number
+      nearestExpiryMs?: number
+      creditsError?: string
+    }> }
   }
   const raw = data.pool?.entries
   if (!Array.isArray(raw)) return []
   return raw.map((e): WorkBuddyCreditEntry => {
     const label = typeof e.label === 'string' && e.label !== '' ? e.label : `端口 ${port}`
     if (typeof e.credits === 'number') {
-      return { label, port, account: label, total: e.credits, packages: e.packages }
+      // 明细必须逐项校验后再带下去：面板会读 remain / expiresAtMs 并参与求和，
+      // 一个 undefined 混进来就会让「显示的 + 藏起来的 = 总额」这条对不上。
+      const detail = Array.isArray(e.creditPackages) ? e.creditPackages : undefined
+      return {
+        label,
+        port,
+        account: label,
+        total: e.credits,
+        packages: e.packages,
+        creditPackages: detail as CreditPackage[] | undefined,
+        expiringSoon: typeof e.expiringSoon === 'number' ? e.expiringSoon : undefined,
+        nearestExpiryMs: typeof e.nearestExpiryMs === 'number' ? e.nearestExpiryMs : undefined,
+      }
     }
     return { label, port, account: label, error: e.creditsError ?? '积分未知' }
   })
@@ -390,11 +518,65 @@ async function readCurrentVersion(port: number, keyName: string): Promise<string
 }
 
 /** 检查（可选并执行）所有仓库更新；force=true 时真正 git 快进，否则只报告。 */
+/**
+ * 读后台自动合并留下的「待重启」标记。
+ *
+ * 这文件从加自动更新那天起就有人写、没人读——于是「已经自动更新过了、
+ * 等你重启代理」这件事只有日志知道。现在读出来交给面板显示。
+ */
+/**
+ * 读后台自动合并留下的「待重启」标记，并**剔掉已经重启过的**。
+ *
+ * 这个文件从加自动更新那天起就有人写、没人读——于是「已经自动更新过了、
+ * 等你重启代理」这件事只有日志知道。现在读出来交给面板显示。
+ *
+ * 但光读会出事：标记一旦写下就再没人清，而代理重启后代码已经是新的。
+ * 于是面板会永远挂着一句「workbuddy-proxy → v1.3.15，重启后生效」，
+ * 而那个仓早就到 1.3.18 且重启过。**显示一条永不消失的假提示，比不显示更糟。**
+ *
+ * 所以这里拿代理**当前跑着的版本**去对：只有「跑着的版本 < 标记里的版本」
+ * 才算真的还没重启。信息不全时保守保留，不凭空断言。
+ */
+export function filterPending(
+  parsed: ReturnType<typeof parseUpdatePending>,
+  running?: ReadonlyMap<string, string>,
+): ReturnType<typeof parseUpdatePending> {
+  if (!running || parsed.repos.length === 0) return parsed
+  const repos = parsed.repos.filter(name => {
+    const cur = running.get(name)
+    const want = parsed.latest[name]
+    // 拿不到版本信息就别乱下结论，保守留着
+    if (cur === undefined || want === undefined) return true
+    return isNewer(want, cur)
+  })
+  const latest: Record<string, string> = {}
+  for (const name of repos) {
+    const v = parsed.latest[name]
+    if (v !== undefined) latest[name] = v
+  }
+  return { repos, latest, checkedAt: parsed.checkedAt }
+}
+
+async function readPending(
+  running?: ReadonlyMap<string, string>,
+): Promise<ReturnType<typeof parseUpdatePending>> {
+  let parsed: ReturnType<typeof parseUpdatePending>
+  try {
+    parsed = parseUpdatePending(await readFile(UPDATE_PENDING_FILE, 'utf8'))
+  } catch {
+    return parseUpdatePending(null)
+  }
+  return filterPending(parsed, running)
+}
+
 async function checkUpdates(force: boolean): Promise<unknown> {
   const specs = []
+  /** 代理当前跑着的版本，用来判断「待重启」标记是不是已经过期。 */
+  const running = new Map<string, string>()
   for (const u of UPDATABLE) {
     const currentVersion = await readCurrentVersion(u.port, u.keyName)
     if (currentVersion === undefined) continue // 代理没启动，跳过
+    running.set(u.name, currentVersion)
     specs.push({
       name: u.name,
       repo: u.repo,
@@ -411,11 +593,11 @@ async function checkUpdates(force: boolean): Promise<unknown> {
       const { isNewer } = await import('./updater.ts')
       repos.push({ name: s.name, current: s.currentVersion, latest, hasUpdate: isNewer(latest, s.currentVersion) })
     }
-    return { mode: 'check', repos }
+    return { mode: 'check', repos, pending: await readPending(running) }
   }
   const { checkAll } = await import('./updater.ts')
   const results = await checkAll(specs, UPDATE_PENDING_FILE, m => log('info', m))
-  return { mode: 'update', results }
+  return { mode: 'update', results, pending: await readPending(running) }
 }
 
 /* ------------------------------------------------------------------ *
@@ -434,11 +616,154 @@ async function checkUpdates(force: boolean): Promise<unknown> {
 
 /** 是否已有一次 apply 在执行。 */
 let applyInFlight = false
+/** 是否已有一次重启在执行。并发重启会杀掉对方刚启动的进程，必须互斥。 */
+let restartInFlight = false
 
-/** 审计日志：时间、来源、确认结果、执行结果。不落单独文件（避免新增写盘）。 */
-function auditApply(req: IncomingMessage, confirmed: boolean, outcome: string): void {
+/* ================= 重启代理（高危） ================= */
+
+/**
+ * 可重启的代理目标。**不含 agent-hub 自己**——那个进程正在处理这个请求，
+ * 它不可能重启自己；文案里也不许出现"全部"。
+ */
+export const RESTART_TARGETS: ReadonlyArray<{ repo: string; dirName: string; ports: number[] }> = [
+  { repo: 'workbuddy-proxy', dirName: 'workbuddy-proxy', ports: [39301, 39302] },
+  { repo: 'trae-proxy', dirName: 'trae-proxy', ports: [39303, 39304] },
+  { repo: 'minimax-proxy', dirName: 'minimax-proxy', ports: [39305, 39306] },
+]
+
+/** 单个仓的等待上限。实测一个仓 stop+start+端口恢复约 4.8 秒，给 40 秒余量充足。 */
+const RESTART_TIMEOUT_MS = 40_000
+
+export interface RestartResult {
+  repo: string
+  ok: boolean
+  error?: string
+  ports: number[]
+}
+
+/** 解析请求体里的确认字段；容忍空体与非法 JSON。 */
+export function parseRestartBody(body: string): { confirmed: boolean } {
+  try {
+    const parsed = JSON.parse(body) as { confirm?: unknown }
+    // 刻意不接受 apply 的口令：两个端点的闸必须各自成立，不能互相通用
+    return { confirmed: parsed.confirm === 'restart' }
+  } catch {
+    return { confirmed: false }
+  }
+}
+
+/** 跑一个 PowerShell 脚本，返回 { code, stderr }。不继承控制台窗口。 */
+function runScript(scriptPath: string, timeoutMs: number): Promise<{ code: number; stderr: string }> {
+  return new Promise(resolve => {
+    const child = spawn(
+      'powershell',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+      { windowsHide: true },
+    )
+    let stderr = ''
+    child.stderr?.on('data', (c: Buffer) => { stderr += c.toString() })
+    // 超时要真的杀掉，否则 stop 脚本卡住会把整个端点挂死
+    const timer = setTimeout(() => { child.kill(); resolve({ code: 1, stderr: `脚本超时（${timeoutMs}ms）` }) }, timeoutMs)
+    child.on('error', (e: Error) => { clearTimeout(timer); resolve({ code: 1, stderr: e.message }) })
+    child.on('close', (code: number | null) => { clearTimeout(timer); resolve({ code: code ?? 1, stderr }) })
+  })
+}
+
+/** 端口是否已经接受连接（够用了：连上说明 HTTP 服务在听）。 */
+async function portAccepts(port: number): Promise<boolean> {
+  return await new Promise<boolean>(resolve => {
+    const sock = new Socket()
+    const done = (v: boolean) => { sock.destroy(); resolve(v) }
+    sock.setTimeout(1000)
+    sock.once('connect', () => done(true))
+    sock.once('timeout', () => done(false))
+    sock.once('error', () => done(false))
+    sock.connect(port, HOST)
+  })
+}
+
+/**
+ * 重启三个代理：逐仓 stop → **等端口关闭** → start → 等端口打开。
+ *
+ * **串行**而不是并行：并行能把 15 秒压到 5 秒，但省下的那点时间不值当，而串行
+ * 能做到「一个仓失败不影响其余」——并行时一个仓的 start 失败会被另一个仓的
+ * 动作掩盖过去。
+ *
+ * ## 中间那步「等端口关闭」是必须的，不是保险
+ *
+ * 第一版没有这步，出了个很典型的假成功：stop 刚杀掉旧进程、端口还没释放时，
+ * start.ps1 会认为「端口已开，跳过」（它本来就是幂等的）并正常返回 0；
+ * 紧接着的「等端口打开」又对着那个**正在死掉的旧进程**探测，连上了 → 报成功。
+ * 然后旧进程彻底退出，端口就再也没人监听了——**端点说成功，代理实际是死的。**
+ *
+ * 所以顺序必须是：确认旧端口已经**关掉**，再启动。否则"重启成功"只是运气。
+ *
+ * 停不下来的仓不会拖住整体：每个仓有自己的超时，失败只记在该条结果上。
+ */
+export async function restartProxies(deps: {
+  /** 执行一步。action='waitClosed'/'waitOpen' 时由实现自己轮询到目标状态或超时。 */
+  run: (
+    t: { repo: string; dirName: string; ports: number[] },
+    action: 'stop' | 'waitClosed' | 'start' | 'waitOpen',
+  ) => Promise<{ code: number; stderr: string }>
+  sleep: (ms: number) => Promise<void>
+  targets?: ReadonlyArray<{ repo: string; dirName: string; ports: number[] }>
+  timeoutMs?: number
+}): Promise<{ ok: boolean; results: RestartResult[] }> {
+  const targets = deps.targets ?? RESTART_TARGETS
+  const timeoutMs = deps.timeoutMs ?? RESTART_TIMEOUT_MS
+  const secs = Math.round(timeoutMs / 1000)
+  const results: RestartResult[] = []
+
+  for (const t of targets) {
+    let error = ''
+    // stop：本来就没在跑时 stop.ps1 会打印 not running 并正常退出，code 仍是 0
+    const stop = await deps.run(t, 'stop')
+    if (stop.code !== 0) error = `停止失败：${stop.stderr.trim() || '未知错误'}`
+    if (!error) {
+      // 等旧进程真正放开端口。见上方注释：跳过这步会得到「报成功但代理已死」。
+      const closed = await deps.run(t, 'waitClosed')
+      if (closed.code !== 0) {
+        error = `停止后 ${secs} 秒内端口仍被占用（可能有别的进程占着）：${closed.stderr.trim() || '超时'}`
+      }
+    }
+    if (!error) {
+      const start = await deps.run(t, 'start')
+      if (start.code !== 0) error = `启动失败：${start.stderr.trim() || '未知错误'}`
+    }
+    if (!error) {
+      const up = await deps.run(t, 'waitOpen')
+      if (up.code !== 0) error = `启动后 ${secs} 秒内端口仍未监听：${up.stderr.trim() || '超时'}`
+    }
+    results.push(error ? { repo: t.repo, ok: false, error, ports: t.ports } : { repo: t.repo, ok: true, ports: t.ports })
+  }
+  return { ok: results.every(r => r.ok), results }
+}
+
+/** 把结果整理成人话。刻意不说"全部已重启"——agent-hub 自己没被重启。 */
+export function describeRestart(r: { ok: boolean; results: RestartResult[] }): string {
+  if (r.results.length === 0) return '没有可重启的代理'
+  const okList = r.results.filter(x => x.ok).map(x => x.repo)
+  const badList = r.results.filter(x => !x.ok)
+  if (r.ok) {
+    return `已重启 ${okList.length} 个代理：${okList.join('、')}。新代码已生效；面板本身（agent-hub）未重启。`
+  }
+  const parts = [`已重启 ${okList.length}/${r.results.length} 个：${okList.join('、') || '无'}`]
+  for (const b of badList) parts.push(`${b.repo} 失败（${b.error ?? '未知'}）`)
+  parts.push('面板本身（agent-hub）未重启。')
+  return parts.join('；')
+}
+
+/**
+ * 审计日志：时间、来源、确认结果、执行结果。不落单独文件（避免新增写盘）。
+ *
+ * 端点名是**参数**而不是写死的：之前重启端点复用了本函数，日志里却一律写成
+ * `/api/update/apply`——审计的全部意义是事后追溯，标错端点名会把排查引向错误的
+ * 地方，比不记还糟。
+ */
+function audit(req: IncomingMessage, endpoint: string, confirmed: boolean, outcome: string): void {
   const ip = req.socket.remoteAddress ?? '?'
-  log('info', `[audit] /api/update/apply from=${ip} confirm=${confirmed ? 'ok' : 'rejected'} result=${outcome}`)
+  log('info', `[audit] ${endpoint} from=${ip} confirm=${confirmed ? 'ok' : 'rejected'} result=${outcome}`)
 }
 
 /** 从请求体里解析确认字段；容忍空体与非法 JSON。 */
@@ -718,6 +1043,60 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     // 认领制：不是 /tool/api 开头的路径会立刻返回 false，继续往下走原路由链。
     if (await toolRouter(req, res, url)) return
 
+    if (req.method === 'POST' && url === '/api/proxies/restart') {
+      const body = await readBody(req)
+      if (!body.ok) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: '请求体过大' })); return }
+      if (!parseRestartBody(body.text).confirmed) {
+        audit(req, '/api/proxies/restart', false, 'bad-confirm')
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: '缺少二次确认：请求体需为 {"confirm":"restart"}' }))
+        return
+      }
+      if (restartInFlight) {
+        audit(req, '/api/proxies/restart', true, 'busy')
+        res.writeHead(409, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: '已有一轮重启正在执行，请等它结束' }))
+        return
+      }
+      restartInFlight = true
+      audit(req, '/api/proxies/restart', true, 'begin')
+      try {
+        const outcome = await restartProxies({
+          run: async (t, action) => {
+            if (action === 'waitClosed' || action === 'waitOpen') {
+              const wantOpen = action === 'waitOpen'
+              const deadline = Date.now() + RESTART_TIMEOUT_MS
+              while (Date.now() < deadline) {
+                // 两个区域都要满足才算到位：只看第一个端口的话，
+                // 第二个区域没起来也会被报成成功。
+                const states = await Promise.all(t.ports.map(p => portAccepts(p)))
+                if (wantOpen ? states.every(Boolean) : states.every(s => !s)) {
+                  return { code: 0, stderr: '' }
+                }
+                await new Promise(r => setTimeout(r, 250))
+              }
+              return { code: 1, stderr: wantOpen ? '端口未监听' : '端口仍被占用' }
+            }
+            const script = action === 'stop' ? 'stop.ps1' : 'start.ps1'
+            return runScript(join(ROOT, '..', t.dirName, 'scripts', script), RESTART_TIMEOUT_MS)
+          },
+          sleep: (ms: number) => new Promise(r => setTimeout(r, ms)),
+        })
+        const message = describeRestart(outcome)
+        audit(req, '/api/proxies/restart', true, outcome.ok ? 'ok' : 'partial')
+        for (const r of outcome.results) {
+          log('info', `重启代理[${r.repo}] ${r.ok ? '成功' : '失败：' + (r.error ?? '')}`)
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ...outcome, message })); return
+      } catch (error) {
+        audit(req, '/api/proxies/restart', true, 'error')
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) })); return
+      } finally {
+        restartInFlight = false
+      }
+    }
     if (req.method === 'GET' && url === '/api/overview') {
       const data = await overviewCached()
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
@@ -735,7 +1114,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const svc = settled.map(r => r.status === 'fulfilled'
         ? r.value
         : { id: '?', port: 0, running: false, error: r.reason instanceof Error ? r.reason.message : String(r.reason) })
-      res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ services: svc })); return
+      // 一并下发重启目标：面板的确认框要列出「会重启哪几个、哪些端口」，
+      // 由服务端给出唯一事实来源，避免面板再硬编码一份端口表而两者漂移。
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ services: svc, restartTargets: RESTART_TARGETS })); return
     }
     if (req.method === 'POST' && url.startsWith('/api/signin/claim')) {
       const body = await readBody(req)
@@ -788,13 +1170,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const body = await readBody(req)
       if (!body.ok) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: '请求体过大' })); return }
       if (parseConfirm(body.text) !== 'apply') {
-        auditApply(req, false, 'bad-confirm')
+        audit(req, '/api/update/apply', false, 'bad-confirm')
         res.writeHead(400, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: '缺少二次确认：请求体需为 {"confirm":"apply"}' }))
         return
       }
       if (applyInFlight) {
-        auditApply(req, true, 'busy')
+        audit(req, '/api/update/apply', true, 'busy')
         res.writeHead(409, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: '已有一次更新正在执行，请稍后重试' }))
         return
@@ -803,10 +1185,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       try {
         const data = await checkUpdates(true)
         const results = (data as { results?: Array<{ name: string; state: string; latest: string }> }).results ?? []
-        auditApply(req, true, results.map(r => `${r.name}=${r.state}@${r.latest}`).join(',') || 'no-repos')
+        audit(req, '/api/update/apply', true, results.map(r => `${r.name}=${r.state}@${r.latest}`).join(',') || 'no-repos')
         res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
       } catch (error) {
-        auditApply(req, true, `error:${error instanceof Error ? error.message : String(error)}`)
+        audit(req, '/api/update/apply', true, `error:${error instanceof Error ? error.message : String(error)}`)
         throw error
       } finally {
         applyInFlight = false
@@ -884,10 +1266,20 @@ async function main(): Promise<void> {
   // 完整 key 只落在 keys/hub.key（0600），不进日志——日志会被追加保存很久。
   log('info', `首次访问请带上 key（见 keys/hub.key）：http://${HOST}:${PORT}/?key=${HUB_KEY.slice(0, 6)}…`)
 
-  // 每日自动检查更新：启动 30 秒后查一次，之后每 24 小时一次。
+  // 每日自动检查更新：启动后在一个约 7.5 分钟的窗口内退避重试，之后每 24 小时一次。
   // 只做 git 快进（ff-only），有更新会写 state/update-pending.json，重启代理后生效。
+  //
+  // 之所以要在启动窗口内重试：readCurrentVersion 是问代理的 /status 要版本号，
+  // 开机时代理常常还没监听端口，一次检查就会把三个仓全跳过，而下一轮在 24 小时后。
   if ((process.env['OPCODE_NO_AUTO_UPDATE'] ?? '') === '') {
-    setTimeout(() => { void checkUpdates(true).catch(() => {}) }, 30_000).unref?.()
+    const sleep = (ms: number): Promise<void> => new Promise(res => setTimeout(res, ms))
+    void startupUpdateCheck({
+      check: async () => await checkUpdates(true) as { results?: unknown[] },
+      total: UPDATABLE.length,
+      delaysMs: STARTUP_RETRY_DELAYS_MS,
+      sleep,
+      log: m => log('info', m),
+    }).catch(() => {}).finally(() => { /* noop */ })
     const updateTimer = setInterval(() => { void checkUpdates(true).catch(() => {}) }, UPDATE_CHECK_MS)
     updateTimer.unref?.()
   }

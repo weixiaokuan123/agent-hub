@@ -182,6 +182,25 @@
   .acct .badge{white-space:normal;text-align:left;line-height:1.45}
   .acct .pts{font-size:14px;font-weight:700;color:var(--brand);font-variant-numeric:tabular-nums}
 
+  /* 积分包到期明细。flex-basis:100% 让它在 .acct 的 flex 行里独占一行，
+     这样不必改动 .acct 自身结构（它是 display:flex + wrap 的横排布局），
+     账号名/端口/余额那三块的排版完全不受影响。 */
+  .acct .expiry{
+    flex:0 0 100%;display:flex;flex-direction:column;gap:2px;
+    padding-top:7px;margin-top:1px;border-top:1px dashed var(--line);
+  }
+  .expiry .ex-row{display:flex;align-items:baseline;gap:8px;font-size:12px;line-height:1.55}
+  .expiry .ex-date{font-weight:700;color:var(--ink-2);min-width:76px;font-variant-numeric:tabular-nums}
+  .expiry .ex-pts{font-weight:700;color:var(--brand);min-width:64px;text-align:right;font-variant-numeric:tabular-nums}
+  .expiry .ex-cnt{color:var(--ink-3);font-variant-numeric:tabular-nums}
+  .expiry .ex-left{margin-left:auto;color:var(--ink-3);font-variant-numeric:tabular-nums;white-space:nowrap}
+  /* 截断时必须说清「还剩几组、共多少分」，否则总额看起来对不上，像显示错了。 */
+  .expiry .ex-more{padding-top:3px;font-size:11.5px;color:var(--ink-3)}
+  .expiry .ex-month{margin-top:4px;padding-top:5px;border-top:1px dashed var(--line)}
+  .expiry .ex-head{color:var(--ink-3);font-size:11.5px}
+  .expiry .ex-warn{color:var(--amber);font-weight:700}
+  .expiry .ex-soon{color:var(--red);font-weight:700}
+
   /* 按钮 */
   .btn{
     display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:36px;padding:0 14px;
@@ -887,6 +906,107 @@ function renderAccounts() {
 }
 
 /* ================= 积分 ================= */
+/* ================= 积分包到期 ================= */
+/** 每个账号最多展示几个到期日组（其余折叠成「另有 N 组」）。 */
+const EXPIRY_GROUPS_LIMIT = 5
+
+/**
+ * 把一个账号的额度包按「到期日」聚合。
+ *
+ * 上游本来就返回逐包的真实到期/刷新时刻（workbuddy-proxy 的 WorkBuddyCreditPackage），
+ * 过去 /status 只透传了 `packages.length` 一个计数，所以面板看不到任何到期信息。
+ * 现在把明细透传下来，由这里聚合成人看得懂的样子。
+ *
+ * 三条必须成立的性质，缺一条就会误导人：
+ *   1. 同一天的包合并——否则 10-20 会重复出现两行，看不出那天一共多少分；
+ *   2. 按日期升序——最近到期的排最前，这才是「紧急」的含义；
+ *   3. 截断时必须报出「还有几组、共多少分」——只显示前 5 组却不提被藏掉的部分，
+ *      会让人以为那就是全部：1487 分的账号看着只剩 509 分，像显示错了。
+ *
+ * 聚合刻意放在面板而不是代理：代理只负责如实报事实，怎么呈现是这边的事。
+ */
+function groupCreditPackages(packages, limit) {
+  const list = Array.isArray(packages) ? packages : []
+  const cap = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : EXPIRY_GROUPS_LIMIT
+  const dayKey = ms => {
+    const d = new Date(ms)
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  }
+  const giftMap = new Map()
+  const monthlyMap = new Map()
+  for (const p of list) {
+    if (!p || typeof p !== 'object') continue
+    const remain = typeof p.remain === 'number' && p.remain > 0 ? p.remain : 0
+    // 月度包（CapacityType 4）不「到期」，它按周期刷新，所以单独成组。
+    const monthly = p.monthly === true
+    const ms = monthly
+      ? (typeof p.refreshAtMs === 'number' ? p.refreshAtMs : undefined)
+      : (typeof p.expiresAtMs === 'number' ? p.expiresAtMs : undefined)
+    const key = ms === undefined ? '不过期' : dayKey(ms)
+    const map = monthly ? monthlyMap : giftMap
+    const g = map.get(key) || { date: key, ms, remain: 0, size: 0, count: 0 }
+    g.remain += remain
+    g.size += typeof p.size === 'number' && p.size > 0 ? p.size : 0
+    g.count++
+    map.set(key, g)
+  }
+  // 没有到期时刻的排最后（用 Infinity 当键），其余按时间升序。
+  const bySoonest = (a, b) => (a.ms ?? Infinity) - (b.ms ?? Infinity)
+  const all = [...giftMap.values()].sort(bySoonest)
+  const hidden = all.slice(cap)
+  return {
+    expiring: all.slice(0, cap),
+    monthly: [...monthlyMap.values()].sort(bySoonest),
+    hiddenGroups: hidden.length,
+    hiddenRemain: hidden.reduce((s, g) => s + g.remain, 0),
+  }
+}
+
+/** 「还有几天」：按日历天算，不按小时差，免得 22 小时被显示成「0 天后」。 */
+function daysLeftText(dayKeyStr) {
+  if (typeof dayKeyStr !== 'string' || dayKeyStr === '不过期') return ''
+  const [y, m, d] = dayKeyStr.split('-').map(Number)
+  if (!y || !m || !d) return ''
+  const today = new Date()
+  const days = Math.round((new Date(y, m - 1, d).getTime() - new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime()) / 86400000)
+  if (days < 0) return '已过期'
+  if (days === 0) return '今天到期'
+  if (days === 1) return '明天到期'
+  if (days < 30) return days + ' 天后'
+  return Math.round(days / 30) + ' 个月后'
+}
+
+/** 同年只显示 MM-DD，省掉重复的年份。 */
+function expiryDateLabel(dayKeyStr) {
+  if (dayKeyStr === '不过期') return '不过期'
+  const [y, m, d] = dayKeyStr.split('-')
+  return String(y) === String(new Date().getFullYear()) ? `${m}-${d}` : dayKeyStr
+}
+
+/** 某个账号的到期明细块；没有明细返回空串（连到旧版代理时不画任何东西）。 */
+function expiryBlockHtml(entry) {
+  const g = groupCreditPackages(entry.creditPackages, EXPIRY_GROUPS_LIMIT)
+  if (!g.expiring.length && !g.monthly.length) return ''
+  const row = x => `<div class="ex-row">
+      <span class="ex-date">${esc(expiryDateLabel(x.date))}</span>
+      <span class="ex-pts num">${n(x.remain)} 分</span>
+      <span class="ex-cnt">${n(x.count)} 个包</span>
+      <span class="ex-left">${esc(daysLeftText(x.date))}</span>
+    </div>`
+  // 月度包显示「已用/总额」——它不是到期而是刷新，看余额看不出还剩多少额度。
+  const monthlyRows = g.monthly.map(x => `<div class="ex-row">
+      <span class="ex-date">${esc(expiryDateLabel(x.date))}</span>
+      <span class="ex-pts num">${n(x.remain)}${x.size ? '/' + n(x.size) : ''} 分</span>
+      <span class="ex-cnt">${n(x.count)} 个月度包</span>
+      <span class="ex-left">${esc(daysLeftText(x.date))}刷新</span>
+    </div>`).join('')
+  return `<div class="expiry">
+    ${g.expiring.length ? '<div class="ex-head">到期日（按临近程度）</div>' + g.expiring.map(row).join('') : ''}
+    ${n(g.hiddenGroups) ? `<div class="ex-more">另有 ${n(g.hiddenGroups)} 组 · 共 ${n(g.hiddenRemain)} 分未标出</div>` : ''}
+    ${monthlyRows ? '<div class="ex-month"><div class="ex-head">月度包（不失效，按周期刷新）</div>' + monthlyRows + '</div>' : ''}
+  </div>`
+}
+
 function renderCredits() {
   const box = document.getElementById('panel-credits')
   let html = ''
@@ -903,8 +1023,11 @@ function renderCredits() {
         <div class="acct-list">
           ${(g.entries || []).map(e => `<div class="acct">
             <span class="nm">${esc(e.account || e.label || '(未识别)')}</span>
-            <span class="meta tiny">:${n(e.port)}${n(e.packages) ? ' · ' + n(e.packages) + ' 个额度包' : ''}</span>
+            <span class="meta tiny">:${n(e.port)}${n(e.packages) ? ' · ' + n(e.packages) + ' 个额度包' : ''}${
+              e.expiringSoon ? ' · <span class="ex-soon">3 天内到期 ' + n(e.expiringSoon) + ' 分</span>' : ''
+            }</span>
             <span class="pts num">${e.total === undefined ? '<span class="tiny" title="' + esc(e.error || '') + '">不可用</span>' : n(e.total) + ' 分'}</span>
+            ${expiryBlockHtml(e)}
           </div>`).join('')}
         </div>`
     }
@@ -951,6 +1074,8 @@ async function loadUpdates(force) {
   renderServices()
   try {
     DATA.updates = await api('/api/update/check')
+    // 后台自动合并写的待重启标记。只读 check 不刷新它，但读出来总比不读强。
+    if (DATA.updates && DATA.updates.pending) updatePending = DATA.updates.pending
     updatesAt = Date.now()
   } catch (e) {
     DATA.updates = null
@@ -966,6 +1091,7 @@ function renderServices() {
   const svcs = DATA.services?.services || []
   const ups = DATA.updates?.repos || []
   const upCount = ups.filter(u => u.hasUpdate).length
+  const restartTargets = DATA.services?.restartTargets || []
 
   let html = `<div class="card">
     <div class="card-title"><span class="dot"></span>本地服务<span class="right">${svcs.filter(s => s.running).length}/${svcs.length} 运行中</span></div>
@@ -976,6 +1102,13 @@ function renderServices() {
         <span class="v">${s.running ? '<span class="badge ok">' + ICON.ok + '运行中</span>' : '<span class="badge err">' + ICON.err + '未运行</span>'}</span>
       </div>`).join('') || '<div class="empty">暂无数据</div>'}
     </div>
+    <div class="btn-row" style="margin-top:12px">
+      <button class="btn" data-act="restart-proxies"${restartInFlight ? ' disabled' : ''}>
+        ${restartInFlight ? '正在重启…' : '重启 3 个代理'}
+      </button>
+    </div>
+    ${restartResult ? '<div class="row sub" style="margin-top:8px"><span class="k">重启结果</span><span class="v tiny">' + esc(restartResult.text) + '</span></div>' : ''}
+    <div class="row sub" style="margin-top:8px"><span class="k">何时需要</span><span class="v tiny">刚更新过版本时重启一次即可生效（合并只改磁盘上的代码）。也可用于代理卡住时手动恢复。<b>重启会中断进行中的模型请求</b>。</span></div>
   </div>`
 
   html += `<div class="card">
@@ -988,11 +1121,183 @@ function renderServices() {
           ? '<span class="badge off">' + ICON.warn + '可更新</span>'
           : '<span class="badge ok">' + ICON.ok + '最新</span>'}</span>
       </div>`).join('')}
-    </div>` : '<div class="empty">进入本页时会自动向 GitHub 查询各仓最新版本。</div>'}
-    <div class="row sub"><span class="k">更新方式</span><span class="v tiny">更新会改动本机代码，不在面板上一键执行；需要时用 <code>POST /api/update/apply</code> 并带 <code>{"confirm":"apply"}</code></span></div>
+    </div>` : '<div class="empty">点「检测更新」查询各仓最新版本（需要联网访问 GitHub）。</div>'}
+    ${(() => {
+      const s = updateButtonState(ups, applyInFlight, applyResult, updatePending)
+      const btn = (act, label, cls) =>
+        `<button class="btn ${cls}" data-act="${act}"${s.disabled ? ' disabled' : ''}>${label}</button>`
+      return `<div class="btn-row" style="margin-top:12px">
+        ${btn('update-check', s.checkLabel, '')}
+        ${s.showApply ? btn('update-apply', '立即更新', 'brand') : ''}
+      </div>
+      ${s.why ? '<div class="row sub" style="margin-top:8px"><span class="k">待更新</span><span class="v tiny">' + esc(s.why) + '</span></div>' : ''}
+      ${s.done ? '<div class="row sub" style="margin-top:8px"><span class="k">结果</span><span class="v tiny">' + esc(s.done) + '</span></div>' : ''}
+      ${s.pending ? '<div class="row sub" style="margin-top:8px"><span class="k">待重启</span><span class="v tiny">' + esc(s.pending) + '</span></div>' : ''}`
+    })()}
+    <div class="row sub"><span class="k">更新方式</span><span class="v tiny">面板启动后约 30 秒会自己查一次、之后每 24 小时查一次，有新版就自动快进（<code>git merge --ff-only</code>，本地有改动会跳过）。<b>合并只改磁盘上的代码，重启代理后才生效</b>——这个按钮只是让你不用等而已。</span></div>
   </div>`
 
   box.innerHTML = html
+}
+
+/* ================= 更新按钮 ================= */
+/** apply 的进行中状态。独立于 DATA，因为它是「操作中」而不是「数据」。 */
+let applyInFlight = false
+/** 上一次 apply 的结果：{ ok: boolean, text: string }。 */
+let applyResult = null
+/** 服务端返回的待重启标记（后台自动合并后写的）。 */
+let updatePending = null
+
+/**
+ * 「服务」页更新按钮的状态机。
+ *
+ * 底层接口本来就有：只读的 GET /api/update/check，和带二次确认的
+ * POST /api/update/apply。缺的只是面板上的入口，所以这里不新增端点。
+ *
+ * 三条不能错的：
+ *   1. **不知道有没有更新之前，绝不显示「立即更新」**——那会诱导用户在
+ *      没查过的情况下就去改磁盘；
+ *   2. **应用中必须禁用**——apply 会在磁盘上跑 git merge，连点两次就是
+ *      并发写同一个 .git/index.lock（服务端虽有 409，但不该靠它兜底）；
+ *   3. **待重启标记即使「全部最新」也要显示**——那正是后台 24h 自动合并
+ *      之后的状态：磁盘上的代码是新的，跑着的进程还是旧的。不显示的话，
+ *      使用者永远不会知道自己其实已经更新过了。
+ */
+function updateButtonState(repos, applying, result, pending) {
+  const checked = Array.isArray(repos) && repos.length > 0
+  const updatable = checked ? repos.filter(r => r && r.hasUpdate) : []
+
+  // 结果优先：有结果就不该在旁边再摆一个「立即更新」催你点
+  const done = result
+    ? (result.ok
+        ? result.text + '　重启代理后生效'
+        : '更新未完成：' + result.text)
+    : ''
+
+  const s = {
+    showApply: false,
+    disabled: !!applying,
+    checkLabel: applying ? '正在更新…' : (checked ? '重新检测' : '检测更新'),
+    why: '',
+    done: done || '',
+    pending: '',
+  }
+
+  if (pending && Array.isArray(pending.repos) && pending.repos.length > 0) {
+    s.pending = pending.repos.length + ' 个仓库已更新，' +
+      (pending.latest && Object.keys(pending.latest).length
+        ? Object.keys(pending.latest).map(k => k + ' → v' + pending.latest[k]).join('、')
+        : pending.repos.join('、')) +
+      '；重启代理后生效'
+  }
+
+  if (applying) return s
+  if (result) return s
+  if (checked && updatable.length > 0) {
+    s.showApply = true
+    s.why = updatable.map(r => r.name + ' ' + r.current + ' → ' + r.latest).join('；')
+  }
+  return s
+}
+
+/** 检测更新：force=true 绕过 30 分钟缓存。 */
+async function checkForUpdates() {
+  applyResult = null
+  updatesAt = 0
+  await loadUpdates(true)
+}
+
+/** 立即更新：二次确认后调 apply。apply 会跑 git merge，可能要十几秒。 */
+async function applyUpdates() {
+  if (applyInFlight) return
+  const ups = DATA.updates?.repos || []
+  const targets = ups.filter(u => u.hasUpdate).map(u => `${u.name} ${u.current} → ${u.latest}`)
+  if (!confirm('将在这几个仓库执行 git fetch + 快进合并：\n\n' + targets.join('\n') +
+               '\n\n本地若有未提交改动会跳过，不会覆盖任何东西。\n继续？')) return
+  applyInFlight = true
+  applyResult = null
+  renderServices()
+  try {
+    const r = await api('/api/update/apply', 'POST', { confirm: 'apply' })
+    updatePending = r?.pending ?? null
+    applyResult = { ok: true, text: describeApply(r) }
+  } catch (e) {
+    applyResult = { ok: false, text: e && e.message ? e.message : String(e) }
+  } finally {
+    applyInFlight = false
+    renderServices()
+  }
+}
+
+/** 把 apply 的返回整理成人话；不认识的形状就说「已完成，请核对版本号」。 */
+function describeApply(r) {
+  const results = Array.isArray(r?.results) ? r.results : []
+  if (results.length === 0) return '检查完成，未发现可应用的更新'
+  const done = results.filter(x => x && x.state === 'updated')
+  const stuck = results.filter(x => x && x.state === 'behind')
+  if (done.length === 0 && stuck.length === 0) return '检查完成，未发现可应用的更新'
+  const parts = []
+  if (done.length) parts.push(done.map(x => x.name + ' → v' + x.latest).join('、'))
+  if (stuck.length) parts.push(stuck.map(x => `${x.name} 未更新（${x.message || '本地有改动或分叉'}）`).join('、'))
+  return parts.join('；')
+}
+
+/* ================= 重启代理 ================= */
+/** 重启进行中。独立状态：它是「操作中」，不是「数据」。 */
+let restartInFlight = false
+let restartResult = null
+
+/**
+ * 重启确认框的文案。
+ *
+ * 两头都不能说错，这是它唯一值得写测试的地方：
+ *   - 一定要说：**进行中的模型请求会失败、需要重发**（连接被掐断，是真的）；
+ *   - 一定要说：**对话记录不会丢失**（它在 opencode 自己的库里，与代理无关）；
+ *   - 一定要说：**本面板不在其中**（agent-hub 正在处理这个请求，重启不了自己）。
+ * 夸大风险会让人不敢点，隐瞒风险会让人误以为无代价——两种都是误导。
+ */
+function restartConfirmText(targets) {
+  const list = Array.isArray(targets) ? targets : []
+  const lines = list.map(t => '  ' + t.repo + '  ' + (t.ports || []).map(p => ':' + p).join(' ')).join('\n')
+  return '将重启 ' + list.length + ' 个代理（约 15 秒）：\n\n' + (lines || '  （未获取到代理列表）') +
+    '\n\n· 重启会中断正在进行中的模型请求——那些请求会报错，需要你重发。' +
+    '\n· 对话记录不会丢失。' +
+    '\n· 本面板（agent-hub）不在其中：它无法重启自己。' +
+    '\n\n继续？'
+}
+
+/**
+ * 重启三个代理。
+ *
+ * 确认框的措辞是刻意的，两头都不能说错：
+ *   - 会发生的：**进行中的模型请求会失败**（连接被掐断），需要重发；
+ *   - 不会发生的：**对话记录不会丢**——它存在 opencode 自己的库里，与代理无关。
+ * 夸大风险会让人不敢点，隐瞒风险会让人误以为无代价，两种都是误导。
+ *   - 还有一条必须说：**重启不了本面板**（agent-hub 正在处理这个请求）。
+ */
+async function restartProxies() {
+  if (restartInFlight) return
+  // 目标由服务端下发，不在面板硬编码一份端口表（两份必然漂移）
+  const targets = (DATA.services && DATA.services.restartTargets) || []
+  const lines = targets.map(t => `  ${t.repo}  ${(t.ports || []).map(p => ':' + p).join(' ')}`).join('\n')
+  if (!confirm(restartConfirmText(targets))) return
+  restartInFlight = true
+  restartResult = null
+  renderServices()
+  renderOverview()
+  try {
+    const r = await api('/api/proxies/restart', 'POST', { confirm: 'restart' })
+    restartResult = { ok: r?.ok !== false, text: r?.message || '' }
+    if (restartResult.ok) toast('代理已重启，正在刷新…', 'ok')
+  } catch (e) {
+    restartResult = { ok: false, text: e && e.message ? e.message : String(e) }
+  } finally {
+    restartInFlight = false
+    renderServices()
+    renderOverview()
+    // 重启后代理内存里的数据（登录态、积分、签到状态）全变了，必须重新拉
+    setTimeout(() => { void refresh() }, 1200)
+  }
 }
 
 /* ================= 渲染总入口 ================= */
@@ -1053,6 +1358,9 @@ document.addEventListener('click', ev => {
     case 'dispatch': void setDispatch(region, btn.getAttribute('data-on') === 'true'); break
     case 'depart': void departOne(region, btn.getAttribute('data-id') || ''); break
     case 'depart-all': void departAll(region); break
+    case 'update-check': void checkForUpdates(); break
+    case 'update-apply': void applyUpdates(); break
+    case 'restart-proxies': void restartProxies(); break
   }
 })
 
