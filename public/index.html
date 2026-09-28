@@ -1114,13 +1114,20 @@ function renderServices() {
   html += `<div class="card">
     <div class="card-title"><span class="dot" style="background:${ups.length ? (upCount ? 'var(--amber)' : 'var(--green)') : 'var(--ink-3)'}"></span>版本<span class="right">${ups.length ? (upCount ? upCount + ' 个可更新' : '全部最新') : (updatesInFlight ? '检查中…' : '未检查')}</span></div>
     ${ups.length ? `<div class="acct-list">
-      ${ups.map(u => `<div class="acct">
-        <span class="nm">${esc(u.name)}</span>
-        <span class="meta tiny num">本地 ${esc(u.current)} → 最新 ${esc(u.latest)}</span>
+      ${ups.map(u => {
+        // agent-hub 自己也在更新列表里，但它**无法从面板重启**（处理请求的进程
+        // 一死就没法回响应）。所以这一行要单独说清「怎么让它生效」，
+        // 否则使用者会以为点完「立即更新」就万事大吉。
+        const isSelf = u.name === 'agent-hub'
+        const needsRestart = isSelf && (u.hasUpdate || (updatePending && updatePending.repos && updatePending.repos.indexOf('agent-hub') >= 0))
+        return `<div class="acct">
+        <span class="nm">${esc(u.name)}${isSelf ? ' <span class="tiny" style="color:var(--ink-3)">（本面板）</span>' : ''}</span>
+        <span class="meta tiny num">本地 ${esc(u.current)} → 最新 ${esc(u.latest)}${needsRestart ? ' · <b style="color:var(--amber)">已合并，需手动重启面板</b>' : ''}</span>
         <span class="v">${u.hasUpdate
           ? '<span class="badge off">' + ICON.warn + '可更新</span>'
-          : '<span class="badge ok">' + ICON.ok + '最新</span>'}</span>
-      </div>`).join('')}
+          : (needsRestart ? '<span class="badge off">' + ICON.warn + '待重启</span>' : '<span class="badge ok">' + ICON.ok + '最新</span>')}</span>
+      </div>`
+      }).join('')}
     </div>` : '<div class="empty">点「检测更新」查询各仓最新版本（需要联网访问 GitHub）。</div>'}
     ${(() => {
       const s = updateButtonState(ups, applyInFlight, applyResult, updatePending)
@@ -1134,7 +1141,7 @@ function renderServices() {
       ${s.done ? '<div class="row sub" style="margin-top:8px"><span class="k">结果</span><span class="v tiny">' + esc(s.done) + '</span></div>' : ''}
       ${s.pending ? '<div class="row sub" style="margin-top:8px"><span class="k">待重启</span><span class="v tiny">' + esc(s.pending) + '</span></div>' : ''}`
     })()}
-    <div class="row sub"><span class="k">更新方式</span><span class="v tiny">面板启动后约 30 秒会自己查一次、之后每 24 小时查一次，有新版就自动快进（<code>git merge --ff-only</code>，本地有改动会跳过）。<b>合并只改磁盘上的代码，重启代理后才生效</b>——这个按钮只是让你不用等而已。</span></div>
+    <div class="row sub"><span class="k">更新方式</span><span class="v tiny">面板启动后约 30 秒会自己查一次、之后每 24 小时查一次，有新版就自动快进（<code>git merge --ff-only</code>，本地有改动会跳过）。<b>合并只改磁盘上的代码，重启后才生效</b>——三个代理由上面的按钮一键重启；<b>本面板（agent-hub）无法从面板重启自己</b>，它更新后需要手动执行：<br><code style="user-select:all">cd "$env:USERPROFILE\\.config\\opencode\\agent-hub"; powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\stop.ps1; powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\start.ps1</code></span></div>
   </div>`
 
   box.innerHTML = html
@@ -1184,11 +1191,13 @@ function updateButtonState(repos, applying, result, pending) {
   }
 
   if (pending && Array.isArray(pending.repos) && pending.repos.length > 0) {
-    s.pending = pending.repos.length + ' 个仓库已更新，' +
-      (pending.latest && Object.keys(pending.latest).length
-        ? Object.keys(pending.latest).map(k => k + ' → v' + pending.latest[k]).join('、')
-        : pending.repos.join('、')) +
-      '；重启代理后生效'
+    // 以 repos 为准去取 latest，而不是遍历 latest 的键——否则某个仓缺 latest
+    // 时它的名字会被静默丢掉，提示里就少了一个仓，而那正是最需要被看见的那个。
+    const names = pending.repos.map(k => (pending.latest && pending.latest[k]) ? k + ' → v' + pending.latest[k] : k)
+    s.pending = pending.repos.length + ' 个仓库已更新：' + names.join('、') +
+      '。' + (pending.repos.indexOf('agent-hub') >= 0
+        ? '其中本面板需要手动重启（下方有命令），'
+        : '') + '点上方「重启 3 个代理」即可让代理生效'
   }
 
   if (applying) return s

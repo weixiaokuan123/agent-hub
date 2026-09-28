@@ -91,6 +91,15 @@ test('待重启标记：即使已全部最新也要显示（这是后台自动�
   assert.match(s.pending, /重启/)
 })
 
+test('待重启标记含 agent-hub 时要点明「本面板需手动重启」', () => {
+  // 只写「重启 3 个代理」是不够的：面板重启不了自己，照着做的人会发现点了没用。
+  const s = panel.updateButtonState(repos(0), false, undefined, {
+    repos: ['workbuddy-proxy', 'agent-hub'], latest: { 'workbuddy-proxy': '1.3.20' },
+  })
+  assert.match(s.pending, /agent-hub/)
+  assert.match(s.pending, /手动重启|手动执行/, '必须区分自身与代理的生效方式')
+})
+
 test('没有待重启标记时不显示该条（不留空占位）', () => {
   const s = panel.updateButtonState(repos(0), false, undefined, { repos: [] })
   assert.equal(s.pending, '')

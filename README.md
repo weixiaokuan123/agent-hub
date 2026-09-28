@@ -73,7 +73,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start.ps1
 - **账号总览**：每个平台/区域的登录账号、登录状态、模型数、代理端口运行状态
 - **签到面板**：今天签没签、连签天数、今日积分、今天的随机计划时刻、最近一次结果
 - **一键签到**：单个平台「立即签到」或顶部「全部签到」（幂等，已签的自动跳过）
-- 每 5 分钟自动刷新（标签页隐藏时暂停，切回时立即刷新一次）
+- 每 15 分钟自动刷新（标签页隐藏时暂停，切回时立即刷新一次）
 
 **它不接触任何凭据**——只通过各代理已有的回环 HTTP 接口聚合数据。
 
@@ -122,15 +122,27 @@ http://127.0.0.1:39310/?key=<你的hub-key>
 
 ## 自动更新
 
-agent-hub 会**代为检查并快进更新**三个代理仓库（workbuddy-proxy / trae-proxy / minimax-proxy）：
+agent-hub 会**代为检查并快进更新**四个仓库——三个代理（workbuddy-proxy / trae-proxy /
+minimax-proxy）**以及它自己**：
 
-- 启动 30 秒后检查一次，之后每 24 小时检查一次
-- 判定依据：各代理 `/healthz` 返回的 `version` ↔ 对应 GitHub 仓库的**最新 tag**（如 `v1.2.1`）
+- 启动后在约 7.5 分钟的窗口内退避重试（0/30/90/210/450 秒），之后每 24 小时检查一次
+- 判定依据：各代理 `/healthz` 返回的 `version`（agent-hub 自身则读本地常量）↔ 对应
+  GitHub 仓库的**最新 tag**（如 `v1.2.1`）
 - 有新版本时执行 `git fetch` + `git merge --ff-only`；本地有未提交改动会跳过，不覆盖任何东西
-- 更新后**不自动重启进程**（避免打断正在进行的对话），只写 `state/update-pending.json` 标记；下次重启生效
+- 更新后**不自动重启进程**（避免打断正在进行的对话），只写 `state/update-pending.json` 标记
+- 面板「服务」页有「检测更新 / 立即更新」按钮，可以不等那 24 小时
 - 用 `OPCODE_NO_AUTO_UPDATE=1` 可完全关闭
 
-> ⚠️ **agent-hub 不能更新自己**（正在运行的进程无法替换自身）。要升级 agent-hub 请手动 `git pull` 后重启。
+### 让更新生效：代理一键，面板要手动
+
+| | 怎么生效 |
+| --- | --- |
+| 三个代理 | 面板「服务」页点「**重启 3 个代理**」（会中断进行中的模型请求，对话记录不丢）。不想开面板就跑 `scripts\restart-proxies.ps1` |
+| **agent-hub 自己** | **只能手动重启**——处理请求的进程一死就没法回响应，而分离脚本延迟重启会让面板整个挂掉、失败时无从察觉：<br>`cd "$env:USERPROFILE\.config\opencode\agent-hub"`<br>`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stop.ps1`<br>`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start.ps1` |
+
+> 代理更新后**磁盘上的代码是新的、跑着的进程还是旧的**，所以「已更新」不等于「已生效」，
+> 必须重启。面板会把这条显示在「服务」页的「待重启」里，并且会自动识别哪些仓真的还没重启
+> （代理重启后旧标记会消失，不会一直挂着"待重启"骗人）。
 >
 > ⚠️ 更新检测**只认 tag**，不认普通 commit。改了代码但没打新 tag，其他机器不会自动跟进。
 

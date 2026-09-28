@@ -53,12 +53,66 @@ const REGIONS: RegionDef[] = [
   { id: 'minimax-en', provider: 'MiniMax', label: '国际版', port: 39306, keyName: 'minimax-proxy/keys/en.key', supportsSignin: true },
 ]
 
-/** 可自动更新的本地仓库（owner/name 与本地目录、健康检查端口）。 */
-const UPDATABLE: Array<{ name: string; repo: string; dirName: string; port: number; keyName: string }> = [
-  { name: 'workbuddy-proxy', repo: 'weixiaokuan123/workbuddy-proxy', dirName: 'workbuddy-proxy', port: 39301, keyName: 'workbuddy-proxy/keys/cn.key' },
-  { name: 'trae-proxy', repo: 'weixiaokuan123/trae-proxy', dirName: 'trae-proxy', port: 39303, keyName: 'trae-proxy/keys/cn.key' },
-  { name: 'minimax-proxy', repo: 'weixiaokuan123/minimax-proxy', dirName: 'minimax-proxy', port: 39305, keyName: 'minimax-proxy/keys/cn.key' },
+/**
+ * 可自动更新的本地仓库。
+ *
+ * 包含 **agent-hub 自己**——之前只有三个代理，于是本面板的更新永远传不出去：
+ * 别人收不到，而 hub 恰恰是承载"自动更新"的那个仓。
+ *
+ * 两类来源：
+ *   - `remote`：问该代理的 /healthz 要版本号（代理可能压根没启动，读不到就跳过）；
+ *   - `local` ：读本地常量（agent-hub 自身——问自己没意义，跑的就是当前这版）。
+ *
+ * 注意 agent-hub **无法从面板重启自己**：处理请求的进程一死就没法回响应，
+ * 而分离脚本延迟重启会让面板整个挂掉、失败时无从察觉。所以合并照常做，
+ * 生效交给使用者手动重启（见 selfRestartHint）。
+ */
+export const UPDATABLE: Array<{
+  name: string
+  repo: string
+  /** 相对 ROOT/.. 的目录名；'.' 表示 agent-hub 自身目录。 */
+  dirName: string
+  source: 'remote' | 'local'
+  port?: number
+  keyName?: string
+}> = [
+  { name: 'workbuddy-proxy', repo: 'weixiaokuan123/workbuddy-proxy', dirName: 'workbuddy-proxy', source: 'remote', port: 39301, keyName: 'workbuddy-proxy/keys/cn.key' },
+  { name: 'trae-proxy', repo: 'weixiaokuan123/trae-proxy', dirName: 'trae-proxy', source: 'remote', port: 39303, keyName: 'trae-proxy/keys/cn.key' },
+  { name: 'minimax-proxy', repo: 'weixiaokuan123/minimax-proxy', dirName: 'minimax-proxy', source: 'remote', port: 39305, keyName: 'minimax-proxy/keys/cn.key' },
+  { name: 'agent-hub', repo: 'weixiaokuan123/agent-hub', dirName: '.', source: 'local' },
 ]
+
+/**
+ * 某个仓的本地目录。
+ *
+ * `dirName === '.'` 表示 ROOT 自己。必须显式处理：`join(ROOT, '..', '.')` 在
+ * Windows 上会得到 `C:\...\opencode\.` —— 那是个**合法路径，git 在里面照样跑得通**，
+ * 所以这个错误不会立刻暴露，只会在日志里显示成一条诡异的路径。
+ */
+export function resolveUpdateDir(dirName: string, root: string = ROOT): string {
+  return dirName === '.' ? root : join(root, '..', dirName)
+}
+
+/**
+ * 某个仓能不能从面板里一键重启。
+ *
+ * 默认 false：未知名字一律不给放行。
+ */
+export function canRestartFromPanel(name: string): boolean {
+  return RESTART_TARGETS.some(t => t.repo === name)
+}
+
+/** 某仓更新后该怎么让它生效。代理有一键按钮，自身只能手动。 */
+export function selfRestartHint(name: string): string {
+  if (canRestartFromPanel(name)) return '点上面的「重启 3 个代理」即可生效'
+  if (name === 'agent-hub') {
+    return '需手动重启本面板（面板无法重启自己）：' +
+      'cd "$env:USERPROFILE\\.config\\opencode\\agent-hub"; ' +
+      'powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\stop.ps1; ' +
+      'powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\start.ps1'
+  }
+  return ''
+}
 const UPDATE_PENDING_FILE = join(ROOT, 'state', 'update-pending.json')
 const UPDATE_CHECK_MS = 24 * 60 * 60 * 1000
 
@@ -574,13 +628,18 @@ async function checkUpdates(force: boolean): Promise<unknown> {
   /** 代理当前跑着的版本，用来判断「待重启」标记是不是已经过期。 */
   const running = new Map<string, string>()
   for (const u of UPDATABLE) {
-    const currentVersion = await readCurrentVersion(u.port, u.keyName)
+    // source='local' 的 agent-hub 读本地常量；问自己没意义，跑的就是当前这版。
+    // 写成假端口去查 /healthz 的话版本永远读成 undefined，会被静默跳过——
+    // 那正是这个条目当初缺席的原因，不能重蹈。
+    const currentVersion = u.source === 'local'
+      ? AGENT_HUB_VERSION
+      : await readCurrentVersion(u.port as number, u.keyName as string)
     if (currentVersion === undefined) continue // 代理没启动，跳过
     running.set(u.name, currentVersion)
     specs.push({
       name: u.name,
       repo: u.repo,
-      dir: join(ROOT, '..', u.dirName),
+      dir: resolveUpdateDir(u.dirName),
       currentVersion,
     })
   }
