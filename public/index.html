@@ -399,6 +399,10 @@ let DATA = { overview: null, wbCredits: null, traeCredits: null, services: null,
  *   live-cn / live-global      → 桌面端当前登录的那个号
  *   acct:switch:<uuid>         → 账号库里的独立账号
  * 两者在 /signin/status 里混在同一个 targets 数组返回。
+ *
+ * 关键区别：live 槽位的签到**归桌面端管**。它能不能领取决于桌面端当前登录的是
+ * 哪个号、那个号有没有开签到活动——这两件事在 opencode 这边都改不了。所以它
+ * 永远不算「待办」，理由要指向桌面端而不是让人干等。
  */
 function isLiveSlot(t) {
   return typeof t.id === 'string' && t.id.startsWith('live-')
@@ -448,12 +452,19 @@ function signinStats(r) {
   const s = r.signin
   if (!s) return null
   const raw = Array.isArray(s.targets) ? s.targets : []
-  // 桌面端「当前登录」槽位（id 形如 live-cn / live-global）不是账号库里可独立
-  // 签到的账号：要么已被同身份账号顶替，要么该账号压根没开签到活动。
-  // 服务端一旦对它给出结论（lastResult 非空）就整条去掉，不再在面板上占位——
-  // 否则每天都会显示「失败：登录态 token 已加密…」，而这恰恰是**不影响使用**的事。
-  // 还没试过的（lastResult 为空）仍然保留，万一它真能领，漏掉才是问题。
-  const targets = raw.filter(t => !isLiveSlot(t) || !hasVerdict(t))
+  // 桌面端「当前登录」槽位（live-cn / live-global）**一律**从进度里剔除，
+  // 而不是「有失败结论才剔除」。
+  //
+  // 为什么连没试过的也剔：它的签到结果归桌面端管——能不能领取决于桌面端当前
+  // 登录的是哪个号、那个号有没有开签到活动，这两件事在 opencode 侧都改不了。
+  // 之前只剔除「已有结论」的，于是每天刚过 0 点、状态文件还是空白的那一小时里，
+  // 它会以「待签到」的身份混进需要处理——而它今天注定签不到（token 被桌面端
+  // 加密），属于每天早上必亮一次、然后自己消失的假警报。
+  //
+  // 剔除了就不必再单列一条提醒：该区域在账号卡上已经以「可用 · 账号库 N 个账号」
+  // 呈现了正向事实，用户也明确要求过「账号能正常读取时不要强调这点」。
+  // 真实账号（acct:switch:*）一个都不少。
+  const targets = raw.filter(t => !isLiveSlot(t))
   if (targets.length > 0) {
     const done = targets.filter(t => t.claimedToday).length
     return { done, total: targets.length, targets }
@@ -464,20 +475,30 @@ function signinStats(r) {
   // minimax-cn 今天已签到 +1000 分，view 里却没有 checkedIn；
   // trae-ai 的 view.enabled=false、view.checkedIn=false，但它压根不支持签到。
   const claimed = s.claimedToday === true || v.checkedIn === true
-  // 「不签到」有两种完全不同的含义，措辞不能混：
-  //   - trae-ai 的「国际区暂不支持自动签到」→ **区域级**：这个区压根不支持
-  //   - workbuddy-global 的「签到活动未开启」→ **账号级**：这个号没开签到活动
-  // 都说成「该区不签到」会让人以为要去换账号，实际什么都不用做。
-  // （原判断用 indexOf('不支持') === 0，而实际文案是「国际区暂不支持…」开头，
-  //   根本匹配不上，只是碰巧被 v.enabled === false 兜住了。）
+  // 「这个号/这个区就是没有签到活动」有三种文案，都**不是待办**——再点多少次
+  // 都不会变，属于「已知情况」：
+  //   - trae-ai「国际区暂不支持自动签到」   → 区域级
+  //   - workbuddy-global「签到活动未开启」  → 账号级
+  //   - 兜底「不适用」
+  // 真正该进待办的只有「还没试过」和「试了但报错、可重试」两类。
+  //
+  // 原来只认「不支持」和 v.enabled === false，但实测 workbuddy-global 的
+  // view.enabled 是 undefined、view.active 才是 false，于是漏判成待办——
+  // 而这一条每天都会出现，属于会养成习惯的假警报。
   const msg = typeof s.lastResult === 'string' ? s.lastResult : ''
-  const regionLevel = msg.includes('不支持')
-  const unsupported = v.enabled === false || regionLevel
+  const regionLevel = /不支持/.test(msg)
+  const accountLevel = /未开启|不适用/.test(msg)
+  const unsupported = regionLevel || accountLevel || v.enabled === false
   return {
     done: claimed ? 1 : 0,
     total: 1,
     targets: [],
-    legacy: { checked: claimed, unsupported, unsupportedLabel: regionLevel ? '该区不签到' : '该账号未开启签到', v },
+    legacy: {
+      checked: claimed,
+      unsupported,
+      unsupportedLabel: regionLevel ? '该区不签到' : '该账号未开启签到',
+      v,
+    },
   }
 }
 
@@ -618,11 +639,12 @@ function collectAttention() {
 
     if (si.legacy) {
       const msg = (r.signin?.lastResult || '').split('；')[0]
-      ;(si.legacy.unsupported ? note : todo).push({
-        provider: r.provider,
-        why: '待签到',
-        text: who + (msg ? '：' + msg : ''),
-      })
+      // 「这个号/这个区就是没有签到活动」是**静态属性**，不是待办、也不是事件。
+      // 它已经写在各自的账号卡上了（「该账号未开启签到」/「该区不签到」），
+      // 再往提醒面板里塞一份，只会让这个面板每天重复播报一件永远不会变的事。
+      if (!si.legacy.unsupported) {
+        todo.push({ provider: r.provider, why: '待签到', text: who + (msg ? '：' + msg : '') })
+      }
       continue
     }
     const open = si.targets.filter(t => !t.claimedToday && !isBlocked(t))
