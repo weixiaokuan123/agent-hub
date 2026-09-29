@@ -378,6 +378,21 @@ function esc(s) {
  * （credits.total、region.port、models…）并没有类型保护：真返回字符串就会
  * 变成可执行标记。统一用 Number() 收敛掉这一整类，比逐处提防可靠。
  */
+/**
+ * 积分数字的显示格式：最多两位小数，去掉尾随 0。
+ *
+ * 之前 `expiryBlockHtml` 直接用 n()，而 n() 只做类型转换不取整。workbuddy 和
+ * MiniMax 的包额度恰好都是整数（800、150、2000），浮点尾巴从没露过；Trae 的
+ * `150 − 1.1412 = 148.8588` 一下子把「148.8588 分」印到了面板上。
+ * 只在**显示层**取整，不动数据——逐包余额之和与 usage_summary 的对账关系不能被破坏。
+ */
+function pts(v) {
+  const x = typeof v === 'number' ? v : Number(v)
+  if (!Number.isFinite(x)) return 0
+  const r = Math.round(x * 100) / 100
+  return Object.is(r, -0) ? 0 : r
+}
+
 function n(v, fallback = 0) {
   const x = typeof v === 'number' ? v : Number(v)
   return Number.isFinite(x) ? x : fallback
@@ -410,7 +425,7 @@ const ICON = {
 }
 
 /* ================= 数据 ================= */
-let DATA = { overview: null, wbCredits: null, traeCredits: null, services: null, updates: null }
+let DATA = { overview: null, wbCredits: null, traeCredits: null, mmCredits: null, services: null, updates: null }
 
 /* ================= 账号状态 ================= */
 /**
@@ -683,6 +698,51 @@ function collectAttention() {
       })
     }
   }
+/** 到期前多少天开始提醒。用户拍的值，全文件只此一处。 */
+const EXPIRY_WARN_DAYS = 7
+
+/**
+ * 「N 天内到期的额度」待办。MiniMax / Trae 共用。
+ *
+ * 返回 null 表示不提醒。判定要点：
+ *   - 窗口内**还有余额**的包才提醒（remain > 0）
+ *   - **已过期的不算**：在上游账上已作废，再提醒就是一条永远消不掉的僵尸提醒
+ *   - 同一平台**只出一条**，不按包刷屏
+ *   - 拿不到数据（error）不提醒——「不可用」不等于「快过期」
+ */
+function expiryTodo(who, view) {
+  if (!view || view.error || !Array.isArray(view.packages) || view.packages.length === 0) return null
+  const now = Date.now()
+  const win = EXPIRY_WARN_DAYS * 86_400_000
+  const soon = view.packages.filter(p => {
+    const d = (typeof p.expiresAtMs === 'number' ? p.expiresAtMs : 0) - now
+    return d > 0 && d <= win && typeof p.remain === 'number' && p.remain > 0
+  })
+  if (soon.length === 0) return null
+  const amountSum = soon.reduce((s, p) => s + p.remain, 0)
+  const nearest = soon.reduce((a, b) => (a.expiresAtMs <= b.expiresAtMs ? a : b))
+  const days = Math.max(0, Math.ceil((nearest.expiresAtMs - now) / 86_400_000))
+  const d2 = new Date(nearest.expiresAtMs)
+  const dateText = `${d2.getFullYear()}-${String(d2.getMonth() + 1).padStart(2, '0')}-${String(d2.getDate()).padStart(2, '0')}`
+  return {
+    provider: who,
+    why: '积分将过期',
+    text: `${pts(amountSum)} 积分将在 ${dateText}（还有 ${days} 天）起陆续过期，用不用掉随你`,
+  }
+}
+
+  // 积分即将过期 —— 属于「需要处理」而不是「已知情况」：
+  // 它可执行（用掉或作废，两个选择都在你手上），这正是待办的判准。
+  // 阈值 7 天由用户拍定；已过期的额度不产生提醒（否则每天一条消不掉的僵尸提醒）。
+  //
+  // 三家共用 expiryTodo()：早先我给 MiniMax 写过一份，服务端又有一份同规则的
+  // expiringSoonNotice()，三份规则迟早会漂。expiryTodo 是唯一的阈值定义处，
+  // 有测试守着（见 test/minimax-credits.test.ts 末条）。
+  for (const [who, view] of [['MiniMax', DATA.mmCredits], ['Trae', DATA.traeCredits]]) {
+    const t = expiryTodo(who, view)
+    if (t) todo.push(t)
+  }
+
   return { todo, note }
 }
 
@@ -989,14 +1049,14 @@ function expiryBlockHtml(entry) {
   if (!g.expiring.length && !g.monthly.length) return ''
   const row = x => `<div class="ex-row">
       <span class="ex-date">${esc(expiryDateLabel(x.date))}</span>
-      <span class="ex-pts num">${n(x.remain)} 分</span>
+      <span class="ex-pts num">${pts(x.remain)} 分</span>
       <span class="ex-cnt">${n(x.count)} 个包</span>
       <span class="ex-left">${esc(daysLeftText(x.date))}</span>
     </div>`
   // 月度包显示「已用/总额」——它不是到期而是刷新，看余额看不出还剩多少额度。
   const monthlyRows = g.monthly.map(x => `<div class="ex-row">
       <span class="ex-date">${esc(expiryDateLabel(x.date))}</span>
-      <span class="ex-pts num">${n(x.remain)}${x.size ? '/' + n(x.size) : ''} 分</span>
+      <span class="ex-pts num">${pts(x.remain)}${x.size ? '/' + pts(x.size) : ''} 分</span>
       <span class="ex-cnt">${n(x.count)} 个月度包</span>
       <span class="ex-left">${esc(daysLeftText(x.date))}刷新</span>
     </div>`).join('')
@@ -1037,7 +1097,22 @@ function renderCredits() {
     html += '<div class="card"><div class="empty">WorkBuddy 积分暂不可用</div></div>'
   }
 
-  // Trae
+  // MiniMax：与 WorkBuddy 同一套「按到期日聚合」渲染，一行逻辑都没重写。
+  // 这能成立是因为代理返回的包字段名与 workbuddy 同构（remain/size/expiresAtMs/monthly）。
+  const m = DATA.mmCredits
+  if (m) {
+    html += `<div class="card">
+      <div class="card-title"><span class="dot" style="background:var(--brand-2)"></span>MiniMax 积分<span class="right num">国内 · :${n(39305)}</span></div>`
+    if (m.error) {
+      html += `<div class="empty">${esc(m.error)}</div>`
+    } else {
+      html += `<div class="row"><span class="k">余额</span><span class="v"><b class="num" style="font-size:22px">${n(m.total)} 分</b></span></div>`
+      html += `<div class="acct" style="border:none;padding:0;background:none">${expiryBlockHtml({ creditPackages: m.packages })}</div>`
+    }
+    html += `<div class="row sub"><span class="k">来源</span><span class="v tiny">${esc('/minimax-cloud/api/v1/credit/details')}</span></div>
+    </div>`
+  }
+
   if (DATA.traeCredits) {
     const t = DATA.traeCredits
     const num = v => (v === undefined ? '—' : Math.round(v * 100) / 100)
@@ -1050,6 +1125,8 @@ function renderCredits() {
       <div style="height:8px;border-radius:6px;background:#eef0f8;overflow:hidden;margin-top:8px">
         <div style="height:100%;width:${Math.min(100, pct * 100).toFixed(1)}%;background:${color};border-radius:6px"></div>
       </div>
+      <div class="acct" style="border:none;padding:0;background:none">${expiryBlockHtml({ creditPackages: t.packages })}</div>
+      ${t.packages?.length ? `<div class="row sub"><span class="k">包</span><span class="v tiny">共 ${n(t.packTotal ?? t.packages.length)} 个，${n(t.packages.length)} 个还有余额</span></div>` : ''}
       <div class="row sub"><span class="k">来源</span><span class="v tiny">${esc(t.error || '/trae/api/v2/pay/ide_user_ent_usage')}</span></div>
     </div>`
   }
@@ -1402,6 +1479,7 @@ async function refresh() {
   await Promise.allSettled([
     api('/api/workbuddy/credits').then(d => { DATA.wbCredits = d }).catch(() => { DATA.wbCredits = null }),
     api('/api/trae/credits').then(d => { DATA.traeCredits = d }).catch(() => { DATA.traeCredits = null }),
+    api('/api/minimax/credits').then(d => { DATA.mmCredits = d }).catch(() => { DATA.mmCredits = null }),
     api('/api/services').then(d => { DATA.services = d }).catch(() => { DATA.services = null }),
   ])
   renderAll()

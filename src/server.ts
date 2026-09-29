@@ -399,6 +399,176 @@ export function parseUpdatePending(raw: string | null | undefined): {
   }
 }
 
+/**
+ * 拉 MiniMax 积分。只有 cn 区本机有凭据，en 区一律降级。
+ * 形状与 workbuddy 同构，所以面板复用同一套聚合。
+ */
+async function minimaxCredits(): Promise<MinimaxCreditView> {
+  const port = 39305
+  const base: MinimaxCreditView = { region: 'cn', packages: [] }
+  try {
+    const key = await readRegionKey('minimax-proxy/keys/cn.key')
+    if (key === null) return { ...base, error: '缺少 key' }
+    const r = await fetchJson(`http://${HOST}:${port}/credits`, key)
+    if (!r.ok || typeof r.data !== 'object' || r.data === null) {
+      return { ...base, error: r.error ?? `HTTP ${r.status ?? '?'}` }
+    }
+    return minimaxCreditView(r.data)
+  } catch (error) {
+    return { ...base, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/* ================= Trae 积分 ================= */
+
+/**
+ * Trae 的积分包视图。字段名与另外两家同构，面板因此复用同一套按到期日聚合。
+ */
+export interface TraeCreditView {
+  region: string
+  /** 由 traeCredits() 补上，纯解析函数不知道端口。 */
+  port?: number
+  enabled?: boolean
+  total?: number
+  consumed?: number
+  /** 权威口径：total − consumed。上游自己的 usage_summary，不要自己加。 */
+  remaining?: number
+  ratio?: number
+  /** 上游一共给了几个包（过滤前）。面板据此说「N 个包里 M 个还有余额」。 */
+  packTotal?: number
+  packages: Array<{ remain: number; size: number; consumed: number; expiresAtMs: number; monthly: boolean }>
+  error?: string
+}
+
+/**
+ * 把 Trae `/credits` 的原样透传收敛成带包明细的视图。
+ *
+ * ## 这里有个实测踩过的坑
+ *
+ * 上游每包给 `entitlement_base_info.quota.credits_limit`（上限）与
+ * `usage.credits_amount`。**`credits_amount` 是「已消耗」，不是「剩余」**——
+ * 余额必须自己算 `limit − amount`。三个数对上才敢这么写：
+ *
+ *     Σ credits_limit  = 7950.000  =  usage_summary.total
+ *     Σ credits_amount = 7350.886  ≈  usage_summary.consumed
+ *     limit − amount    =  599.114  =  剩余
+ *
+ * 且实测发请求后 `amount` 由 0.886 涨到 1.1412（**涨**）；若它是「剩余」，
+ * 用掉 0.25 应该让它减少。
+ */
+export function traeCreditView(raw: unknown): TraeCreditView {
+  // 非对象必须**报错**，不能静默变成空视图。
+  // fetchJson 在响应体不是 JSON 时会把原始文本塞进来（上游返回一张状态码 200 的
+  // HTML 错误页就是这种），那样面板会显示「剩余 —、总额 —」的空卡片且不报错，
+  // 看着像"本来就没额度"。空对象 {} 则不同——那是"上游确实没给"，当空视图合理。
+  if (typeof raw !== 'object' || raw === null) {
+    return {
+      region: 'cn',
+      packages: [],
+      packTotal: 0,
+      error: `上游返回了非对象（${typeof raw}），无法解析`,
+    }
+  }
+  const o = raw as Record<string, unknown>
+  const out: TraeCreditView = { region: 'cn', packages: [] }
+  if (typeof o['error'] === 'string') { out.error = o['error']; return out }
+  if (typeof o['region'] === 'string') out.region = o['region']
+
+  const u = (typeof o['usage'] === 'object' && o['usage'] !== null ? o['usage'] : {}) as Record<string, unknown>
+  const s = (typeof u['usage_summary'] === 'object' && u['usage_summary'] !== null
+    ? u['usage_summary'] : {}) as Record<string, unknown>
+  if (typeof s['total_amount'] === 'number') out.total = s['total_amount']
+  if (typeof s['consumed_amount'] === 'number') out.consumed = s['consumed_amount']
+  if (typeof s['consumption_ratio'] === 'number') out.ratio = s['consumption_ratio']
+  if (typeof out.total === 'number' && typeof out.consumed === 'number') {
+    out.remaining = Math.max(0, out.total - out.consumed)
+  }
+
+  const list = Array.isArray(u['user_entitlement_pack_list']) ? u['user_entitlement_pack_list'] : []
+  // 过滤**前**的总数。面板要靠它说清「27 个包里 4 个还有余额」——
+  // 少了这个，面板只能猜，而它猜的「其余已用光」并不总成立（脏包也是被丢掉的）。
+  out.packTotal = list.length
+  for (const raw2 of list) {
+    if (typeof raw2 !== 'object' || raw2 === null) continue
+    const p = raw2 as Record<string, unknown>
+    const b = (typeof p['entitlement_base_info'] === 'object' && p['entitlement_base_info'] !== null
+      ? p['entitlement_base_info'] : {}) as Record<string, unknown>
+    const q = (typeof b['quota'] === 'object' && b['quota'] !== null ? b['quota'] : {}) as Record<string, unknown>
+    const limit = typeof q['credits_limit'] === 'number' ? q['credits_limit'] : undefined
+    // 缺 credits_limit 的包（「免费」）必须跳过：当 0 处理会显示出一个假的空到期组
+    if (limit === undefined) continue
+    const usedRaw = (typeof p['usage'] === 'object' && p['usage'] !== null ? p['usage'] : {}) as Record<string, unknown>
+    const used = typeof usedRaw['credits_amount'] === 'number' ? usedRaw['credits_amount'] : 0
+    const remain = Math.max(0, limit - used)
+    // 已用光的丢掉：实测 27 个包里 22 个已用光，不剔就多出 22 行 0 分
+    if (remain <= 0) continue
+    const endTime = typeof b['end_time'] === 'number' ? b['end_time'] : 0
+    if (endTime <= 0) continue
+    out.packages.push({
+      remain,
+      size: limit,
+      consumed: used,
+      expiresAtMs: endTime * 1000,   // 上游是**秒**，忘了 ×1000 会落在 1970 年
+      monthly: false,
+    })
+  }
+  return out
+}
+
+/* ================= MiniMax 积分 ================= */
+
+/**
+ * MiniMax 的积分包视图。
+ *
+ * 字段名**刻意与 workbuddy 的包一致**——面板的 `groupCreditPackages()` 因此能原样
+ * 复用，不必为 MiniMax 写第二套按到期日聚合。这是整个设计的地基。
+ */
+export interface MinimaxCreditView {
+  region: string
+  total?: number
+  packages: Array<{
+    remain: number
+    size: number
+    consumed: number
+    expiresAtMs: number
+    monthly: boolean
+  }>
+  expiringSoon?: number
+  nearestExpiryMs?: number
+  error?: string
+}
+
+/** 把代理的 /credits 返回收敛成一个安全形状。 */
+export function minimaxCreditView(raw: unknown): MinimaxCreditView {
+  const o = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>
+  const out: MinimaxCreditView = {
+    region: typeof o['region'] === 'string' ? o['region'] : 'cn',
+    packages: [],
+  }
+  if (typeof o['error'] === 'string') {
+    // 拿不到就不能编一个 0 出来——0 会被面板读成「余额为零」，比报错更糟
+    out.error = o['error']
+    return out
+  }
+  if (typeof o['total'] === 'number') out.total = o['total']
+  if (typeof o['expiringSoon'] === 'number') out.expiringSoon = o['expiringSoon']
+  if (typeof o['nearestExpiryMs'] === 'number') out.nearestExpiryMs = o['nearestExpiryMs']
+  const list = Array.isArray(o['packages']) ? o['packages'] : []
+  for (const p of list) {
+    if (typeof p !== 'object' || p === null) continue
+    const r = p as Record<string, unknown>
+    if (typeof r['remain'] !== 'number' || typeof r['expiresAtMs'] !== 'number') continue
+    out.packages.push({
+      remain: r['remain'],
+      size: typeof r['size'] === 'number' ? r['size'] : r['remain'],
+      consumed: typeof r['consumed'] === 'number' ? r['consumed'] : 0,
+      expiresAtMs: r['expiresAtMs'],
+      monthly: r['monthly'] === true,
+    })
+  }
+  return out
+}
+
 export function parsePoolEntries(
   statusData: unknown,
   port: number,
@@ -487,20 +657,10 @@ async function workbuddyCredits(): Promise<{
 
 /**
  * Trae 额度用量：查询 trae-proxy 的 /credits（上游 /trae/api/v2/pay/ide_user_ent_usage）。
- * 只取用量摘要：已用 consumed、总额 total、比例 ratio、剩余 remaining。
- * 上游字段缺失时各项为 undefined，前端显示「—」。
+ *
+ * 解析全部交给 traeCreditView()（有测试覆盖），这里只负责取凭据、发请求、补端口。
+ * 早先这里手搓了一份同字段解析，等于同一套逻辑写两遍——那份现在已删。
  */
-interface TraeCreditView {
-  region: string
-  port: number
-  enabled: boolean
-  consumed?: number
-  total?: number
-  remaining?: number
-  ratio?: number
-  error?: string
-}
-
 async function traeCredits(): Promise<TraeCreditView> {
   const port = 39303
   const base: TraeCreditView = { region: 'cn', port, enabled: false }
@@ -508,27 +668,15 @@ async function traeCredits(): Promise<TraeCreditView> {
     const key = await readRegionKey('trae-proxy/keys/cn.key')
     if (key === null) return { ...base, error: '缺少 key' }
     const r = await fetchJson(`http://${HOST}:${port}/credits`, key)
+    // 非对象必须当错误处理，不能交给 traeCreditView 静默变成空视图。
+    // fetchJson 在响应体不是 JSON 时会把**原始文本**塞进 data（比如上游返回
+    // 一张状态码 200 的 HTML 错误页）——那样面板会显示一张「剩余 —、总额 —」
+    // 的空卡片还不报错，看着像"本来就没额度"。
     if (!r.ok || typeof r.data !== 'object' || r.data === null) {
       return { ...base, error: r.error ?? `HTTP ${r.status ?? '?'}` }
     }
-    const d = r.data as {
-      enabled?: boolean
-      usage?: {
-        usage_summary?: { consumed_amount?: number; total_amount?: number; consumption_ratio?: number }
-      }
-    }
-    const s = d.usage?.usage_summary
-    const consumed = typeof s?.consumed_amount === 'number' ? s.consumed_amount : undefined
-    const total = typeof s?.total_amount === 'number' ? s.total_amount : undefined
-    return {
-      region: 'cn',
-      port,
-      enabled: d.enabled !== false,
-      ...(consumed === undefined ? {} : { consumed }),
-      ...(total === undefined ? {} : { total }),
-      ...(consumed !== undefined && total !== undefined ? { remaining: Math.max(0, total - consumed) } : {}),
-      ...(typeof s?.consumption_ratio === 'number' ? { ratio: s.consumption_ratio } : {}),
-    }
+    const d = r.data as { enabled?: boolean }
+    return { ...traeCreditView(r.data), port, enabled: d.enabled !== false }
   } catch (error) {
     return { ...base, error: error instanceof Error ? error.message : String(error) }
   }
@@ -911,6 +1059,50 @@ async function overviewCached(): Promise<unknown> {
   return overviewInFlight
 }
 
+/**
+ * 三个积分端点的共享缓存。
+ *
+ * ## 为什么需要它
+ *
+ * trae-proxy 的 `/credits` **没有任何缓存**——实测连续 4 次请求耗时
+ * 163 / 144 / 296 / 146 ms，每次都真连 Trae 上游（workbuddy 代理侧有 60s TTL，
+ * 所以它第二次就掉到 6 ms）。
+ *
+ * 放大路径有两条：
+ *   1. 面板每 15 分钟刷一次，且 `refresh()` 一次性拉**全部**积分端点——
+ *      哪怕你正停在「服务」页，Trae 上游照样被敲；
+ *   2. 开 N 个标签页就是 N 倍。现在浏览器里就开着十几个 hub 标签。
+ *
+ * 代理侧加缓存只能压住第 1 条，压不住第 2 条（多标签是并发的）。
+ * 放在 hub 这里，一处同时解决两条。
+ *
+ * ## 为什么是 60 秒
+ *
+ * 和 workbuddy / minimax 代理侧的 TTL 一致。积分只在真正发请求时才变，
+ * 60 秒内的陈旧值用户察觉不到；而这期间上游的结算本身还有 3–5 分钟延迟
+ * （Trae 实测），缓存 60 秒并不比上游更不准。
+ */
+const CREDITS_TTL_MS = 60 * 1000
+const creditsCaches = new Map<string, { at: number; data: unknown }>()
+const creditsInFlight = new Map<string, Promise<unknown>>()
+
+async function creditsCached(key: string, load: () => Promise<unknown>): Promise<unknown> {
+  const hit = creditsCaches.get(key)
+  if (hit !== undefined && Date.now() - hit.at < CREDITS_TTL_MS) return hit.data
+  // 单飞：并发的未命中只发一次上游请求，其余 await 同一个 Promise。
+  // 没有这一步，十几标签同时刷就是同时向上游开十几枪。
+  const running = creditsInFlight.get(key)
+  if (running !== undefined) return running
+  const p = load()
+    .then((data) => {
+      creditsCaches.set(key, { at: Date.now(), data })
+      return data
+    })
+    .finally(() => { creditsInFlight.delete(key) })
+  creditsInFlight.set(key, p)
+  return p
+}
+
 async function claim(id: string): Promise<{ ok: boolean; status?: number; data?: unknown; error?: string }> {
   const def = REGIONS.find(r => r.id === id)
   if (!def) return { ok: false, error: `未知区域：${id}` }
@@ -1160,12 +1352,17 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const data = await overviewCached()
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
     }
+    if (req.method === 'GET' && url === '/api/minimax/credits') {
+      // MiniMax 全球区本机没有凭据，那一区拿不到就是拿不到——如实降级，不假装有
+      const data = await creditsCached('minimax', minimaxCredits)
+      res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
+    }
     if (req.method === 'GET' && url === '/api/workbuddy/credits') {
-      const data = await workbuddyCredits()
+      const data = await creditsCached('workbuddy', workbuddyCredits)
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
     }
     if (req.method === 'GET' && url === '/api/trae/credits') {
-      const data = await traeCredits()
+      const data = await creditsCached('trae', traeCredits)
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
     }
     if (req.method === 'GET' && url === '/api/services') {
