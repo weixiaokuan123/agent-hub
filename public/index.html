@@ -1141,10 +1141,17 @@ function renderServices() {
       ${s.done ? '<div class="row sub" style="margin-top:8px"><span class="k">结果</span><span class="v tiny">' + esc(s.done) + '</span></div>' : ''}
       ${s.pending ? '<div class="row sub" style="margin-top:8px"><span class="k">待重启</span><span class="v tiny">' + esc(s.pending) + '</span></div>' : ''}`
     })()}
-    <div class="row sub"><span class="k">更新方式</span><span class="v tiny">面板启动后约 30 秒会自己查一次、之后每 24 小时查一次，有新版就自动快进（<code>git merge --ff-only</code>，本地有改动会跳过）。<b>合并只改磁盘上的代码，重启后才生效</b>——三个代理由上面的按钮一键重启；<b>本面板（agent-hub）无法从面板重启自己</b>，它更新后需要手动执行：<br><code style="user-select:all">cd "$env:USERPROFILE\\.config\\opencode\\agent-hub"; powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\stop.ps1; powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\start.ps1</code></span></div>
+    <div class="row sub"><span class="k">更新方式</span><span class="v tiny">面板启动后约 30 秒会自己查一次、之后每 24 小时查一次，有新版就自动快进（<code>git merge --ff-only</code>，本地有改动会跳过）。<b>合并只改磁盘上的代码，重启后才生效</b>——三个代理由上面的按钮一键重启；<b>本面板（agent-hub）无法从面板重启自己</b>，它更新后需要手动执行：<br><code style="user-select:all" id="selfRestartCmd"></code><span id="selfRestartMissing" class="tiny" style="color:var(--ink-3);display:none">（重启命令由服务端下发；未取到请查看 agent-hub 的 logs）</span></span></div>
   </div>`
 
   box.innerHTML = html
+  // 重启命令由服务端下发，不在面板硬编码安装路径——别人换个目录装就会拿到
+  // 一条跑不通的命令。取不到就留空并说明，绝不显示一个假的路径。
+  const cmd = document.getElementById('selfRestartCmd')
+  const missing = document.getElementById('selfRestartMissing')
+  const selfText = (DATA.services && DATA.services.selfRestart && DATA.services.selfRestart.text) || ''
+  if (cmd) cmd.textContent = selfText
+  if (missing) missing.style.display = selfText ? 'none' : 'inline'
 }
 
 /* ================= 更新按钮 ================= */

@@ -1173,10 +1173,15 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const svc = settled.map(r => r.status === 'fulfilled'
         ? r.value
         : { id: '?', port: 0, running: false, error: r.reason instanceof Error ? r.reason.message : String(r.reason) })
-      // 一并下发重启目标：面板的确认框要列出「会重启哪几个、哪些端口」，
-      // 由服务端给出唯一事实来源，避免面板再硬编码一份端口表而两者漂移。
+      // 一并下发重启目标与「本面板怎么重启」：面板的确认框要列出「会重启哪几个、
+      // 哪些端口」，而 agent-hub 自己的生效方式也必须来自这里——硬编码安装路径会在
+      // 别人换安装目录时给出跑不通的命令。
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ services: svc, restartTargets: RESTART_TARGETS })); return
+      res.end(JSON.stringify({
+        services: svc,
+        restartTargets: RESTART_TARGETS,
+        selfRestart: { repo: 'agent-hub', text: selfRestartHint('agent-hub') },
+      })); return
     }
     if (req.method === 'POST' && url.startsWith('/api/signin/claim')) {
       const body = await readBody(req)
