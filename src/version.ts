@@ -1,5 +1,3 @@
-/**
- * agent-hub 版本号（semver）。用于启动日志与 /healthz 的 version 字段，
- * 供自动更新检测比对。发布时手动递增。
- */
-export const AGENT_HUB_VERSION = '1.2.21'
+﻿/**
+ * agent-hub 鐗堟湰鍙凤紙semver锛夈€傜敤浜庡惎鍔ㄦ棩蹇椾笌 /healthz 鐨?version 瀛楁锛? * 渚涜嚜鍔ㄦ洿鏂版娴嬫瘮瀵广€傚彂甯冩椂鎵嬪姩閫掑銆? */
+export const AGENT_HUB_VERSION = '1.2.22'

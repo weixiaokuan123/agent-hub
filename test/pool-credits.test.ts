@@ -24,20 +24,20 @@ test('正常池：展开每个账号的积分', () => {
     pool: {
       size: 3,
       entries: [
-        { id: 'live-cn', label: 'cn·当前登录', preferred: true, rateLimited: false, remainingSec: 0, credits: 2069, packages: 10 },
-        { id: 'acct:1', label: 'cn·示例昵称甲', preferred: false, rateLimited: false, remainingSec: 0, credits: 1382, packages: 20 },
-        { id: 'acct:2', label: 'cn·13800138001', preferred: false, rateLimited: true, remainingSec: 900, credits: 2071, packages: 4 },
+        { id: 'live-cn', label: 'cn·当前登录', preferred: true, rateLimited: false, remainingSec: 0, credits: 1234, packages: 7 },
+        { id: 'acct:1', label: 'cn·账号甲', preferred: false, rateLimited: false, remainingSec: 0, credits: 567, packages: 11 },
+        { id: 'acct:2', label: 'cn·账号乙', preferred: false, rateLimited: true, remainingSec: 900, credits: 890, packages: 3 },
       ],
     },
   }, 39301)
 
   assert.equal(entries.length, 3)
-  assert.deepEqual(entries.map(e => e.total), [2069, 1382, 2071])
-  assert.deepEqual(entries.map(e => e.packages), [10, 20, 4])
+  assert.deepEqual(entries.map(e => e.total), [1234, 567, 890])
+  assert.deepEqual(entries.map(e => e.packages), [7, 11, 3])
   assert.ok(entries.every(e => e.port === 39301))
   assert.ok(entries.every(e => e.error === undefined))
   // 冷却中的账号仍有积分，不因此被剔除
-  assert.equal(entries[2]?.total, 2071)
+  assert.equal(entries[2]?.total, 890)
 })
 
 test('某账号积分缺失 → 该条带 creditsError，其余照常', () => {
