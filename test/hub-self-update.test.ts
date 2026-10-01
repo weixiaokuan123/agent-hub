@@ -93,8 +93,18 @@ test('dirName="." 解析成 ROOT 本身，不带尾部的 "."', () => {
   assert.ok(!dir.endsWith('.'), `不该以 "." 结尾：${dir}`)
 })
 
-test('其他仓解析到 ROOT 的同级目录', () => {
-  const root = 'C:\\a\\opencode\\agent-hub'
-  assert.equal(resolveUpdateDir('trae-proxy', root), 'C:\\a\\opencode\\trae-proxy')
-  assert.equal(resolveUpdateDir('workbuddy-proxy', root), 'C:\\a\\opencode\\workbuddy-proxy')
+test('代理目录从 proxyRoot 解析，不再从 hub 上一级硬推', () => {
+  // 旧断言是「代理在 hub 的上一级」。四个仓搬进 proxy-suite\ 之后，
+  // 「上一级」变成了 proxy-suite 的父目录，于是所有跨仓路径全错一位——
+  // 而且**不报错**，只是积分读空、重启按钮没反应。
+  // 所以这里显式传 proxyRoot，证明解析看的是它、而不是 ROOT 的父目录。
+  const root = 'C:\\a\\proxy-suite\\agent-hub'
+  const proxyRoot = 'C:\\a\\proxy-suite'
+  assert.equal(resolveUpdateDir('trae-proxy', root, proxyRoot), 'C:\\a\\proxy-suite\\trae-proxy')
+  assert.equal(resolveUpdateDir('workbuddy-proxy', root, proxyRoot), 'C:\\a\\proxy-suite\\workbuddy-proxy')
+  assert.equal(resolveUpdateDir('minimax-proxy', root, proxyRoot), 'C:\\a\\proxy-suite\\minimax-proxy')
+
+  // 关键回归：给了 proxyRoot 就绝不能退回「hub 的上一级」。
+  // 上一级在嵌套布局下是 C:\\a，指过去等于指到一个跟代理毫无关系的目录。
+  assert.notEqual(resolveUpdateDir('trae-proxy', root, proxyRoot), 'C:\\a\\trae-proxy')
 })

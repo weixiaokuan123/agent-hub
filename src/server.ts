@@ -24,11 +24,21 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AGENT_HUB_VERSION } from './version.ts'
 import { createToolRouter } from './tool-api.ts'
+import { resolveProxyRoot, suiteDir } from './proxy-root.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
 const PUBLIC_DIR = join(ROOT, 'public')
 const KEYS_DIR = join(ROOT, 'keys')
+
+/**
+ * 三个代理共同所在的目录。
+ *
+ * 解析规则见 proxy-root.ts。**不要**再在这里写 `join(ROOT, '..')`：
+ * 那条路径在四个仓一起搬进 proxy-suite\ 之后会指向 proxy-suite 的父目录，
+ * 于是积分读空、重启按钮失效，而且**不报错**——是那种能瞒很久的静默退化。
+ */
+const PROXY_ROOT = resolveProxyRoot(ROOT)
 
 const PORT = Number(process.env['AGENT_HUB_PORT'] ?? 39310)
 const HOST = '127.0.0.1'
@@ -89,8 +99,8 @@ export const UPDATABLE: Array<{
  * Windows 上会得到 `C:\...\opencode\.` —— 那是个**合法路径，git 在里面照样跑得通**，
  * 所以这个错误不会立刻暴露，只会在日志里显示成一条诡异的路径。
  */
-export function resolveUpdateDir(dirName: string, root: string = ROOT): string {
-  return dirName === '.' ? root : join(root, '..', dirName)
+export function resolveUpdateDir(dirName: string, root: string = ROOT, proxyRoot: string = PROXY_ROOT): string {
+  return suiteDir(dirName, proxyRoot, root)
 }
 
 /**
@@ -209,7 +219,7 @@ async function readRegionKey(keyName: string): Promise<string | null> {
   const cached = regionKeyCache.get(keyName)
   if (cached !== undefined) return cached
   try {
-    const value = (await readFile(join(ROOT, '..', keyName), 'utf8')).trim()
+    const value = (await readFile(join(PROXY_ROOT, keyName), 'utf8')).trim()
     if (value === '') return null
     regionKeyCache.set(keyName, value)
     return value
@@ -225,7 +235,7 @@ async function readKeyDir(dirName: string): Promise<string[]> {
   const cached = keyDirCache.get(dirName)
   if (cached !== undefined) return cached
   try {
-    const names = await readdir(join(ROOT, '..', dirName))
+    const names = await readdir(join(PROXY_ROOT, dirName))
     keyDirCache.set(dirName, names)
     return names
   } catch {
@@ -1329,7 +1339,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
               return { code: 1, stderr: wantOpen ? '端口未监听' : '端口仍被占用' }
             }
             const script = action === 'stop' ? 'stop.ps1' : 'start.ps1'
-            return runScript(join(ROOT, '..', t.dirName, 'scripts', script), RESTART_TIMEOUT_MS)
+            return runScript(join(PROXY_ROOT, t.dirName, 'scripts', script), RESTART_TIMEOUT_MS)
           },
           sleep: (ms: number) => new Promise(r => setTimeout(r, ms)),
         })
