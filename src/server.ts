@@ -61,6 +61,9 @@ const REGIONS: RegionDef[] = [
   { id: 'trae-ai', provider: 'Trae', label: '国际版', port: 39304, keyName: 'trae-proxy/keys/ai.key', supportsSignin: true },
   { id: 'minimax-cn', provider: 'MiniMax', label: '国内版', port: 39305, keyName: 'minimax-proxy/keys/cn.key', supportsSignin: true },
   { id: 'minimax-en', provider: 'MiniMax', label: '国际版', port: 39306, keyName: 'minimax-proxy/keys/en.key', supportsSignin: true },
+  // Qoder 目前只有一个区域（国内网关 gateway.qoder.com.cn），
+  // 且没有签到接口，所以 supportsSignin 为 false。
+  { id: 'qoder-cn', provider: 'Qoder', label: '国内版', port: 39307, keyName: 'qoder-proxy/keys/cn.key', supportsSignin: false },
 ]
 
 /**
