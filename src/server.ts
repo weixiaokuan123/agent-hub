@@ -61,9 +61,10 @@ const REGIONS: RegionDef[] = [
   { id: 'trae-ai', provider: 'Trae', label: '国际版', port: 39304, keyName: 'trae-proxy/keys/ai.key', supportsSignin: true },
   { id: 'minimax-cn', provider: 'MiniMax', label: '国内版', port: 39305, keyName: 'minimax-proxy/keys/cn.key', supportsSignin: true },
   { id: 'minimax-en', provider: 'MiniMax', label: '国际版', port: 39306, keyName: 'minimax-proxy/keys/en.key', supportsSignin: true },
-  // Qoder 目前只有一个区域（国内网关 gateway.qoder.com.cn），
-  // 且没有签到接口，所以 supportsSignin 为 false。
-  { id: 'qoder-cn', provider: 'Qoder', label: '国内版', port: 39307, keyName: 'qoder-proxy/keys/cn.key', supportsSignin: false },
+  // Qoder 目前只有一个区域（国内网关 gateway.qoder.com.cn）。
+  // 签到走 openapi 的 campaigns 接口（qoder-proxy 的 /signin/*），
+  // 每日 0 点（UTC+8）刷新，可领 100 Credits。
+  { id: 'qoder-cn', provider: 'Qoder', label: '国内版', port: 39307, keyName: 'qoder-proxy/keys/cn.key', supportsSignin: true },
 ]
 
 /**
@@ -432,8 +433,37 @@ async function minimaxCredits(): Promise<MinimaxCreditView> {
   }
 }
 
-/* ================= Trae 积分 ================= */
+/* ================= Qoder 积分 ================= */
 
+/**
+ * 拉 Qoder 积分。
+ *
+ * qoder-proxy 的 `/credits` 刻意与 MiniMax 同构（`total` / `packages[]` /
+ * `expiringSoon` / `nearestExpiryMs`），所以直接复用 `minimaxCreditView()`，
+ * 不为 Qoder 写第二套解析。
+ *
+ * Qoder 只有 cn 一个区。
+ */
+async function qoderCredits(): Promise<MinimaxCreditView> {
+  const port = 39307
+  const base: MinimaxCreditView = { region: 'cn', packages: [] }
+  try {
+    const key = await readRegionKey('qoder-proxy/keys/cn.key')
+    if (key === null) return { ...base, error: '缺少 key' }
+    const r = await fetchJson(`http://${HOST}:${port}/credits`, key)
+    if (!r.ok || typeof r.data !== 'object' || r.data === null) {
+      return { ...base, error: r.error ?? `HTTP ${r.status ?? '?'}` }
+    }
+    // 代理拿不到上游时返回 200 + { error }，要原样透出而不是当成 0 余额
+    const d = r.data as { error?: unknown }
+    if (typeof d.error === 'string') return { ...base, error: d.error }
+    return minimaxCreditView(r.data)
+  } catch (error) {
+    return { ...base, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/* ================= Trae 积分 ================= */
 /**
  * Trae 的积分包视图。字段名与另外两家同构，面板因此复用同一套按到期日聚合。
  */
@@ -1376,6 +1406,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
     if (req.method === 'GET' && url === '/api/trae/credits') {
       const data = await creditsCached('trae', traeCredits)
+      res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
+    }
+    if (req.method === 'GET' && url === '/api/qoder/credits') {
+      const data = await creditsCached('qoder', qoderCredits)
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
     }
     if (req.method === 'GET' && url === '/api/services') {

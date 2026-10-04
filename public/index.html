@@ -420,12 +420,13 @@ const ICON = {
   workbuddy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a4 4 0 0 1 4 4v1h1a3 3 0 0 1 0 6h-1v4a3 3 0 0 1-6 0v-1H9a3 3 0 0 1 0-6h1V6a4 4 0 0 1 2-3.46"/></svg>',
   trae: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-14 9V3z"/></svg>',
   minimax: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 12h8M12 8v8"/></svg>',
+  qoder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l9 5v10l-9 5-9-5V7l9-5z"/><path d="M12 12l9-5M12 12v10M12 12L3 7"/></svg>',
   bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>',
   check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>',
 }
 
 /* ================= 数据 ================= */
-let DATA = { overview: null, wbCredits: null, traeCredits: null, mmCredits: null, services: null, updates: null }
+let DATA = { overview: null, wbCredits: null, traeCredits: null, mmCredits: null, qoderCredits: null, services: null, updates: null }
 
 /* ================= 账号状态 ================= */
 /**
@@ -738,7 +739,7 @@ function expiryTodo(who, view) {
   // 三家共用 expiryTodo()：早先我给 MiniMax 写过一份，服务端又有一份同规则的
   // expiringSoonNotice()，三份规则迟早会漂。expiryTodo 是唯一的阈值定义处，
   // 有测试守着（见 test/minimax-credits.test.ts 末条）。
-  for (const [who, view] of [['MiniMax', DATA.mmCredits], ['Trae', DATA.traeCredits]]) {
+  for (const [who, view] of [['MiniMax', DATA.mmCredits], ['Trae', DATA.traeCredits], ['Qoder', DATA.qoderCredits]]) {
     const t = expiryTodo(who, view)
     if (t) todo.push(t)
   }
@@ -765,7 +766,7 @@ function renderHeroChips() {
   let html = ''
   for (const [p, g] of Object.entries(byProvider)) {
     const ok = g.list.filter(r => (authOf(r).kind === 'ok')).length
-    const icon = p === 'WorkBuddy' ? ICON.workbuddy : p === 'Trae' ? ICON.trae : ICON.minimax
+    const icon = p === 'WorkBuddy' ? ICON.workbuddy : p === 'Trae' ? ICON.trae : p === 'Qoder' ? ICON.qoder : ICON.minimax
     // 大数字已经占了 ok/len，副标题就别再重复一遍（曾显示成「1/2 1/2 就绪」）。
     const sub = ok === g.list.length ? '全部就绪' : (g.list.length - ok) + ' 个未就绪'
     html += `<button class="chip${todoProviders.has(p) ? ' alert' : ''}" onclick="goTab('accounts')">
@@ -834,7 +835,7 @@ function renderOverview() {
   const byProvider = {}
   for (const r of regions) { (byProvider[r.provider] ??= []).push(r) }
   for (const [p, list] of Object.entries(byProvider)) {
-    const icon = p === 'WorkBuddy' ? ICON.workbuddy : p === 'Trae' ? ICON.trae : ICON.minimax
+    const icon = p === 'WorkBuddy' ? ICON.workbuddy : p === 'Trae' ? ICON.trae : p === 'Qoder' ? ICON.qoder : ICON.minimax
     const tv = list.map(travelStats).find(t => t && t.count > 0)
     html += `<div class="card">
       <div class="card-title">${icon}${esc(p)}<span class="right">${list.length} 个区域</span></div>
@@ -1128,6 +1129,23 @@ function renderCredits() {
       <div class="acct" style="border:none;padding:0;background:none">${expiryBlockHtml({ creditPackages: t.packages })}</div>
       ${t.packages?.length ? `<div class="row sub"><span class="k">包</span><span class="v tiny">共 ${n(t.packTotal ?? t.packages.length)} 个，${n(t.packages.length)} 个还有余额</span></div>` : ''}
       <div class="row sub"><span class="k">来源</span><span class="v tiny">${esc(t.error || '/trae/api/v2/pay/ide_user_ent_usage')}</span></div>
+    </div>`
+  }
+
+  // Qoder：与 MiniMax 同样复用「按到期日聚合」渲染。
+  // 代理返回的字段同构（remain/size/expiresAtMs/monthly），一行逻辑都没重写。
+  // 到期日由代理从签到接口补来——实测 quota/usage 的 expiresAt 恒为 9999 年哨兵值。
+  const qd = DATA.qoderCredits
+  if (qd) {
+    html += `<div class="card">
+      <div class="card-title"><span class="dot" style="background:var(--brand-2)"></span>Qoder Credits<span class="right num">国内 · :${n(39307)}</span></div>`
+    if (qd.error) {
+      html += `<div class="empty">${esc(qd.error)}</div>`
+    } else {
+      html += `<div class="row"><span class="k">余额</span><span class="v"><b class="num" style="font-size:22px">${n(qd.total)} Credits</b></span></div>`
+      html += `<div class="acct" style="border:none;padding:0;background:none">${expiryBlockHtml({ creditPackages: qd.packages })}</div>`
+    }
+    html += `<div class="row sub"><span class="k">来源</span><span class="v tiny">${esc('/api/v2/quota/usage')}</span></div>
     </div>`
   }
 
@@ -1480,6 +1498,7 @@ async function refresh() {
     api('/api/workbuddy/credits').then(d => { DATA.wbCredits = d }).catch(() => { DATA.wbCredits = null }),
     api('/api/trae/credits').then(d => { DATA.traeCredits = d }).catch(() => { DATA.traeCredits = null }),
     api('/api/minimax/credits').then(d => { DATA.mmCredits = d }).catch(() => { DATA.mmCredits = null }),
+    api('/api/qoder/credits').then(d => { DATA.qoderCredits = d }).catch(() => { DATA.qoderCredits = null }),
     api('/api/services').then(d => { DATA.services = d }).catch(() => { DATA.services = null }),
   ])
   renderAll()
