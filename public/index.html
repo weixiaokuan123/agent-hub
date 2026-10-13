@@ -1083,7 +1083,7 @@ function renderCredits() {
       html += `<div class="sect-title">${esc(g.label)}<span class="num">${n(g.total)} 分</span></div>
         <div class="acct-list">
           ${(g.entries || []).map(e => `<div class="acct">
-            <span class="nm">${esc(e.account || e.label || '(未识别)')}</span>
+            <span class="nm">${e.isNextCandidate ? '<span class="badge ok" style="margin-right:6px;font-size:10px">当前使用</span>' : ''}${esc(e.account || e.label || '(未识别)')}</span>
             <span class="meta tiny">:${n(e.port)}${n(e.packages) ? ' · ' + n(e.packages) + ' 个额度包' : ''}${
               e.expiringSoon ? ' · <span class="ex-soon">3 天内到期 ' + n(e.expiringSoon) + ' 分</span>' : ''
             }</span>

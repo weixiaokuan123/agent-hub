@@ -97,3 +97,62 @@ test('小计语义：总和忽略查不到的账号', () => {
   const total = entries.reduce((sum, e) => sum + (e.total ?? 0), 0)
   assert.equal(total, 42)
 })
+
+// ---------- nextCandidateId：当前首选候选标记 ----------
+
+test('nextCandidateId 匹配的条目被标记为 isNextCandidate', () => {
+  const entries = parsePoolEntries({
+    pool: {
+      nextCandidateId: 'acct:1',
+      entries: [
+        { id: 'live-cn', label: 'cn·当前登录', credits: 1234, packages: 7 },
+        { id: 'acct:1', label: 'cn·账号甲', credits: 567, packages: 11 },
+        { id: 'acct:2', label: 'cn·账号乙', credits: 890, packages: 3 },
+      ],
+    },
+  }, 39301)
+
+  assert.notEqual(entries[0]?.isNextCandidate, true, '非匹配账号不应标记')
+  assert.equal(entries[1]?.isNextCandidate, true, 'acct:1 匹配 nextCandidateId 应标记')
+  assert.notEqual(entries[2]?.isNextCandidate, true, '非匹配账号不应标记')
+})
+
+test('nextCandidateId 缺省时不标记任何条目（连到旧版代理降级）', () => {
+  const entries = parsePoolEntries({
+    pool: {
+      entries: [
+        { id: 'live-cn', label: 'a', credits: 1, packages: 1 },
+        { id: 'acct:1', label: 'b', credits: 2, packages: 1 },
+      ],
+    },
+  }, 39301)
+  assert.ok(entries.every(e => !e.isNextCandidate), '无 nextCandidateId 时不应标记任何条目')
+})
+
+test('nextCandidateId 指向不存在的 id 时不标记任何条目', () => {
+  const entries = parsePoolEntries({
+    pool: {
+      nextCandidateId: 'acct:nonexistent',
+      entries: [
+        { id: 'live-cn', label: 'a', credits: 1, packages: 1 },
+        { id: 'acct:1', label: 'b', credits: 2, packages: 1 },
+      ],
+    },
+  }, 39301)
+  assert.ok(entries.every(e => !e.isNextCandidate), '指向不存在的 id 不应标记任何条目')
+})
+
+test('条目 id 不外发（acct:<uid> 是敏感标识，只用于内部比对）', () => {
+  const entries = parsePoolEntries({
+    pool: {
+      nextCandidateId: 'acct:1',
+      entries: [
+        { id: 'live-cn', label: 'a', credits: 1, packages: 1 },
+        { id: 'acct:1', label: 'b', credits: 2, packages: 1 },
+      ],
+    },
+  }, 39301)
+  assert.ok(entries.every(e => !('id' in e)), '返回值里不得出现候选 id')
+  // 但比对结果必须保留：acct:1 命中 nextCandidateId
+  assert.equal(entries[1]?.isNextCandidate, true)
+})

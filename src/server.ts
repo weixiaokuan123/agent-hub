@@ -299,13 +299,23 @@ interface WorkBuddyCreditEntry {
   port: number
   /** 账号显示名（用于识别，仅本地面板展示）。 */
   account?: string
+  /**
+   * 是否为当前首选候选（按「积分最近到期优先 + 未限流在前」排序后的第一个）。
+   * 面板据此在积分页标记「当前使用」。
+   * 缺省（连到旧版代理不返回 nextCandidateId）时为 false。
+   *
+   * 刻意**不携带候选 id**：`acct:<uid>` 是账号稳定主键，而本结构体会被原样
+   * 塞进 /api/workbuddy/credits 的响应体发给浏览器。id 只在 parsePoolEntries
+   * 内部用于比对，比对出的布尔值才是面板需要的。
+   */
+  isNextCandidate?: boolean
   total?: number
   packages?: number
   /**
    * 逐包明细（到期 / 刷新时刻 + 剩余额度）。
    *
    * 代理过去只给 `packages` 一个计数，所以面板无法展示任何到期信息；
-   * 现在代理把明细一并透传，这里原样带下去，聚合由面板做。
+   * 现在把明细一并透传，这里原样带下去，聚合由面板做。
    * 字段缺失（连到旧版本代理）时为 undefined，面板按「无明细」降级。
    */
   creditPackages?: CreditPackage[]
@@ -617,20 +627,31 @@ export function parsePoolEntries(
   port: number,
 ): WorkBuddyCreditEntry[] {
   const data = (typeof statusData === 'object' && statusData !== null ? statusData : {}) as {
-    pool?: { entries?: Array<{
-      label?: string
-      credits?: number
-      packages?: number
-      creditPackages?: unknown
-      expiringSoon?: number
-      nearestExpiryMs?: number
-      creditsError?: string
-    }> }
+    pool?: {
+      entries?: Array<{
+        id?: string
+        label?: string
+        credits?: number
+        packages?: number
+        creditPackages?: unknown
+        expiringSoon?: number
+        nearestExpiryMs?: number
+        creditsError?: string
+      }>
+      nextCandidateId?: string
+    }
   }
   const raw = data.pool?.entries
+  const nextId = typeof data.pool?.nextCandidateId === 'string' ? data.pool!.nextCandidateId! : undefined
   if (!Array.isArray(raw)) return []
   return raw.map((e): WorkBuddyCreditEntry => {
     const label = typeof e.label === 'string' && e.label !== '' ? e.label : `端口 ${port}`
+    // 候选 id（acct:<uid>）是账号稳定主键，属敏感标识。它只在本函数内部用于
+    // 与 nextCandidateId 比对，**不写进返回值**——返回值会被原样塞进
+    // /api/workbuddy/credits 的响应体发给浏览器，而面板只需要 isNextCandidate
+    // 这个布尔值，不需要 uid。（label 里的 show 名是既有的、面板本就要显示的。）
+    const id = typeof e.id === 'string' && e.id !== '' ? e.id : undefined
+    const isNextCandidate = id !== undefined && nextId !== undefined && id === nextId
     if (typeof e.credits === 'number') {
       // 明细必须逐项校验后再带下去：面板会读 remain / expiresAtMs 并参与求和，
       // 一个 undefined 混进来就会让「显示的 + 藏起来的 = 总额」这条对不上。
@@ -639,6 +660,7 @@ export function parsePoolEntries(
         label,
         port,
         account: label,
+        ...(isNextCandidate ? { isNextCandidate } : {}),
         total: e.credits,
         packages: e.packages,
         creditPackages: detail as CreditPackage[] | undefined,
@@ -646,7 +668,13 @@ export function parsePoolEntries(
         nearestExpiryMs: typeof e.nearestExpiryMs === 'number' ? e.nearestExpiryMs : undefined,
       }
     }
-    return { label, port, account: label, error: e.creditsError ?? '积分未知' }
+    return {
+      label,
+      port,
+      account: label,
+      ...(isNextCandidate ? { isNextCandidate } : {}),
+      error: e.creditsError ?? '积分未知',
+    }
   })
 }
 
