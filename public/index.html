@@ -201,6 +201,19 @@
   .expiry .ex-warn{color:var(--amber);font-weight:700}
   .expiry .ex-soon{color:var(--red);font-weight:700}
 
+  /* 每日用量历史表。窄屏靠外层 overflow-x:auto 横向滚动，
+     不让表格把整张卡片撑破。 */
+  table.hist{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:6px}
+  table.hist th,table.hist td{
+    padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap;
+  }
+  table.hist th{
+    font-size:11.5px;font-weight:700;color:var(--ink-3);position:sticky;top:0;background:#fbfcff;
+  }
+  table.hist td.num,table.hist th.num{text-align:right;font-variant-numeric:tabular-nums}
+  table.hist tbody tr:first-child td{font-weight:700}
+  table.hist tbody tr:last-child td{border-bottom:none}
+
   /* 按钮 */
   .btn{
     display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:36px;padding:0 14px;
@@ -426,7 +439,7 @@ const ICON = {
 }
 
 /* ================= 数据 ================= */
-let DATA = { overview: null, wbCredits: null, traeCredits: null, mmCredits: null, qoderCredits: null, services: null, updates: null }
+let DATA = { overview: null, wbCredits: null, traeCredits: null, mmCredits: null, qoderCredits: null, services: null, updates: null, creditHistory: null }
 
 /* ================= 账号状态 ================= */
 /**
@@ -1003,9 +1016,14 @@ function groupCreditPackages(packages, limit) {
     const ms = monthly
       ? (typeof p.refreshAtMs === 'number' ? p.refreshAtMs : undefined)
       : (typeof p.expiresAtMs === 'number' ? p.expiresAtMs : undefined)
-    const key = ms === undefined ? '不过期' : dayKey(ms)
+    // 0 是「到期日未知」的约定值，不是 1970-01-01 这个时刻。
+    // qoder 的 credits.ts 在上游给的是 9999 年哨兵值或查不到时，会把 expiresAtMs
+    // 归一成 0（见 QoderCreditPackage 的注释「没有可信到期日时为 0，调用方应据此
+    // 跳过」）。只判 undefined 会让 new Date(0) 渲染成 1970-01-01，看着像数据坏了。
+    const hasMs = typeof ms === 'number' && ms > 0
+    const key = hasMs ? dayKey(ms) : '不过期'
     const map = monthly ? monthlyMap : giftMap
-    const g = map.get(key) || { date: key, ms, remain: 0, size: 0, count: 0 }
+    const g = map.get(key) || { date: key, ms: hasMs ? ms : undefined, remain: 0, size: 0, count: 0 }
     g.remain += remain
     g.size += typeof p.size === 'number' && p.size > 0 ? p.size : 0
     g.count++
@@ -1068,9 +1086,80 @@ function expiryBlockHtml(entry) {
   </div>`
 }
 
+/**
+ * 每日用量历史表。
+ *
+ * 数据来自 /api/credits/history：每行一天，列是四家国内版。
+ * 三种单元格状态必须能区分开，否则用户会误读：
+ *   - 数字       → 当天确实用了这么多；
+ *   - 0          → 确实没用（或余额涨了、按 0 记）；
+ *   - 「—」      → 算不出来（缺基准 / 尚未结算），**不是** 0。
+ *
+ * 最后一天恒为未结算（还没有次日基准），显示「统计中」而不是「—」，
+ * 免得让人以为数据坏了。
+ */
+function historyTableHtml() {
+  const h = DATA.creditHistory
+  if (!h) return '<div class="card"><div class="empty">用量历史暂不可用</div></div>'
+
+  const providers = Array.isArray(h.providers) ? h.providers : []
+  const days = Array.isArray(h.days) ? h.days : []
+  const today = typeof h.today === 'string' ? h.today : ''
+  const signin = h.todaySignin && typeof h.todaySignin === 'object' ? h.todaySignin : {}
+
+  // 今天签到了多少：只显示有值的家，全无就不显示这一行
+  const signinParts = providers
+    .filter(p => typeof signin[p.id] === 'number' && signin[p.id] > 0)
+    .map(p => `${esc(p.label)} +${pts(signin[p.id])}`)
+
+  let html = `<div class="card">
+    <div class="card-title"><span class="dot" style="background:var(--brand-2)"></span>每日用量<span class="right">最近 ${days.length} 天</span></div>`
+
+  if (signinParts.length) {
+    html += `<div class="row sub"><span class="k">今日签到</span><span class="v tiny">${signinParts.join(' · ')}（已从用量里扣除）</span></div>`
+  }
+
+  if (days.length === 0) {
+    html += `<div class="empty">还没有历史数据。
+      <div class="tiny" style="margin-top:8px">每天 0:00 自动采一次基准，次日 0:00 结算出前一天用量。<br>
+      今天刚部署的话，明天才会出现第一行。</div>
+      <div class="btn-row" style="margin-top:10px"><button class="btn sm" data-act="sample-history">立即采样</button></div>
+    </div></div>`
+    return html
+  }
+
+  // 表格按日期倒序：最近的在最上面，才符合「看今天用了多少」的习惯
+  const rows = [...days].reverse()
+  html += `<div style="overflow-x:auto"><table class="hist">
+    <thead><tr><th>日期</th>${providers.map(p => `<th class="num">${esc(p.label)}</th>`).join('')}</tr></thead>
+    <tbody>${rows.map(d => {
+      const isToday = typeof d.date === 'string' && d.date === today
+      const cells = providers.map(p => {
+        const v = d.used ? d.used[p.id] : null
+        if (v === null || v === undefined) {
+          return `<td class="num">${isToday ? '<span class="tiny" title="尚无次日基准，明天 0:00 结算">统计中</span>' : '<span class="tiny">—</span>'}</td>`
+        }
+        const credited = d.credited && d.credited[p.id] === true
+        return `<td class="num">${v === 0 ? '0' : pts(v)}${credited ? ' <span class="tiny" title="余额上升超过签到所得，可能是额度包刷新或奖励，按 0 记">↑</span>' : ''}</td>`
+      }).join('')
+      return `<tr><td class="num">${esc(d.date || '')}${isToday ? ' <span class="tiny">今天</span>' : ''}</td>${cells}</tr>`
+    }).join('')}</tbody>
+  </table></div>
+  <div class="row sub"><span class="k">说明</span><span class="v tiny">
+    用量 = 当日 0 点余额 − 次日 0 点余额 + 当日签到所得；「—」表示那次没有取到余额，无法计算，不是 0。
+    ${h.lastSampledDate ? '数据截至 ' + esc(h.lastSampledDate) + '。' : ''}
+  </span></div>
+  <div class="btn-row" style="margin-top:8px"><button class="btn sm" data-act="sample-history">立即采样</button></div>
+  </div>`
+  return html
+}
+
 function renderCredits() {
   const box = document.getElementById('panel-credits')
   let html = ''
+
+  // 每日用量放在最上面：用户最常看的就是「今天/最近用掉多少」
+  html += historyTableHtml()
 
   // WorkBuddy
   if (DATA.wbCredits) {
@@ -1472,6 +1561,7 @@ document.addEventListener('click', ev => {
     case 'update-check': void checkForUpdates(); break
     case 'update-apply': void applyUpdates(); break
     case 'restart-proxies': void restartProxies(); break
+    case 'sample-history': void sampleHistory(); break
   }
 })
 
@@ -1500,6 +1590,7 @@ async function refresh() {
     api('/api/minimax/credits').then(d => { DATA.mmCredits = d }).catch(() => { DATA.mmCredits = null }),
     api('/api/qoder/credits').then(d => { DATA.qoderCredits = d }).catch(() => { DATA.qoderCredits = null }),
     api('/api/services').then(d => { DATA.services = d }).catch(() => { DATA.services = null }),
+    api('/api/credits/history').then(d => { DATA.creditHistory = d }).catch(() => { DATA.creditHistory = null }),
   ])
   renderAll()
   refreshInFlight = false
@@ -1608,6 +1699,27 @@ function showDepart(r, title) {
   if (!results.length) { toast(title + '：没有可派遣的账号', ''); return }
   toast(title + '\n' + results.map(x => x.label + '：' + (x.message || (x.ok ? '已派出' : '失败'))).join('\n'),
     results.some(x => x.ok) ? 'ok' : 'err')
+}
+
+/**
+ * 手动补采一次积分基准。
+ *
+ * 用途：装机当天就想看到基准（否则要等明天 0 点）、或怀疑 0 点那次因为关机漏了。
+ * 服务端在「四家都没取到余额」时会拒绝写入并说明原因，这里如实转述——
+ * 不把「没采到」显示成「已采样」。
+ */
+async function sampleHistory() {
+  try {
+    const r = await api('/api/credits/history/sample', 'POST', {})
+    if (r && r.saved) {
+      toast(`已采样 ${r.date}（${(r.sampled || []).join('/')}）`, 'ok')
+    } else {
+      toast((r && r.message) || '未写入', 'err')
+    }
+  } catch (e) {
+    toast('采样失败：' + e.message, 'err')
+  }
+  await refresh()
 }
 
 /* ================= 定时刷新 ================= */

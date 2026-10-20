@@ -25,6 +25,20 @@ import { fileURLToPath } from 'node:url'
 import { AGENT_HUB_VERSION } from './version.ts'
 import { createToolRouter } from './tool-api.ts'
 import { resolveProxyRoot, suiteDir } from './proxy-root.ts'
+import {
+  HISTORY_PROVIDERS,
+  PROVIDER_LABELS,
+  dailyUsages,
+  localDateOf,
+  msUntilNextLocalMidnight,
+  parseHistoryFile,
+  pruneSamples,
+  sumSigninCredits,
+  upsertSample,
+  type CreditHistoryFile,
+  type DailySample,
+  type HistoryProvider,
+} from './credit-history.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
@@ -1183,6 +1197,239 @@ async function claim(id: string): Promise<{ ok: boolean; status?: number; data?:
   return { ok: res.ok, status: res.status, data: res.data, error: res.error }
 }
 
+/* ================= 每日积分用量历史 ================= */
+
+/** 历史文件位置：与 update-pending.json 同目录，hub 自己的 state。 */
+const CREDIT_HISTORY_FILE = join(ROOT, 'state', 'credit-history.json')
+
+/** 只保留最近 N 天（用户明确要求）。 */
+const CREDIT_HISTORY_KEEP_DAYS = 30
+
+/**
+ * 每家「国内版」的余额与签到入口。
+ *
+ * 刻意只取国内版：用户要的是「WorkBuddy 国内版用了多少、Trae 国内版用了多少」，
+ * 国际版是另一套账号体系，混在一起没有意义。
+ */
+const HISTORY_SOURCES: ReadonlyArray<{
+  provider: HistoryProvider
+  /** 积分接口返回形状不同，用各自的取值函数抽余额。 */
+  creditsUrl: string
+  keyName: string
+  /** 从 /credits 响应里取出「当前余额」；取不到返回 undefined。 */
+  pickBalance: (data: unknown) => number | undefined
+  /**
+   * 签到状态文件（相对 PROXY_ROOT）。读不到就当作「今天还没签到」——
+   * 这只会让用量偏高，不会编出一个假的低用量。
+   */
+  signinRelPath: string
+}> = [
+  {
+    provider: 'workbuddy',
+    creditsUrl: `http://${HOST}:39301/status`,
+    keyName: 'workbuddy-proxy/keys/cn.key',
+    // WorkBuddy 的 /status 里，池内各账号积分相加才是该区总量。
+    // 单个账号查不到就跳过（不能当 0，否则总量偏低）。
+    pickBalance: (data) => {
+      const d = (typeof data === 'object' && data !== null ? data : {}) as {
+        pool?: { entries?: Array<{ credits?: unknown }> }
+      }
+      const entries = d.pool?.entries
+      if (!Array.isArray(entries) || entries.length === 0) return undefined
+      let sum = 0
+      let seen = 0
+      for (const e of entries) {
+        if (typeof e?.credits === 'number' && Number.isFinite(e.credits)) { sum += e.credits; seen++ }
+      }
+      return seen > 0 ? sum : undefined
+    },
+    signinRelPath: 'workbuddy-proxy/state/signin-state-cn.json',
+  },
+  {
+    provider: 'trae',
+    creditsUrl: `http://${HOST}:39303/credits`,
+    keyName: 'trae-proxy/keys/cn.key',
+    // Trae 的 /credits **顶层没有 remaining**：它原样透传上游的
+    // `usage.usage_summary.{total_amount, consumed_amount}`，余额要自己算
+    // （与 agent-hub 的 traeCreditView 同一口径：total − consumed）。
+    // 实测 total_amount=4350、consumed_amount=1073.14 → 余额 3276.86。
+    pickBalance: (data) => {
+      const d = (typeof data === 'object' && data !== null ? data : {}) as {
+        usage?: { usage_summary?: { total_amount?: unknown; consumed_amount?: unknown } }
+      }
+      const s = d.usage?.usage_summary
+      if (s === undefined || s === null) return undefined
+      const total = s.total_amount
+      const consumed = s.consumed_amount
+      if (typeof total !== 'number' || typeof consumed !== 'number') return undefined
+      if (!Number.isFinite(total) || !Number.isFinite(consumed)) return undefined
+      return Math.max(0, total - consumed)
+    },
+    signinRelPath: 'trae-proxy/state/signin-state-cn.json',
+  },
+  {
+    provider: 'minimax',
+    creditsUrl: `http://${HOST}:39305/credits`,
+    keyName: 'minimax-proxy/keys/cn.key',
+    pickBalance: (data) => {
+      const d = (typeof data === 'object' && data !== null ? data : {}) as { total?: unknown; error?: unknown }
+      if (typeof d.error === 'string') return undefined
+      return typeof d.total === 'number' && Number.isFinite(d.total) ? d.total : undefined
+    },
+    signinRelPath: 'minimax-proxy/state/signin-state-cn.json',
+  },
+  {
+    provider: 'qoder',
+    creditsUrl: `http://${HOST}:39307/credits`,
+    keyName: 'qoder-proxy/keys/cn.key',
+    pickBalance: (data) => {
+      const d = (typeof data === 'object' && data !== null ? data : {}) as { total?: unknown; error?: unknown }
+      if (typeof d.error === 'string') return undefined
+      return typeof d.total === 'number' && Number.isFinite(d.total) ? d.total : undefined
+    },
+    signinRelPath: 'qoder-proxy/state/signin-state-cn.json',
+  },
+]
+
+/**
+ * 读某家的签到状态文件，抽出「日期 / 是否已领 / 结果文本」。
+ *
+ * 各家文件结构一致（`{ [target]: { date, claimed, result } }`），只是 target 键不同：
+ * WorkBuddy 是 `acct:switch:<uuid>`（池里多个号），其余是 `cn`。
+ * 所以这里**遍历所有条目**，不是只认某个固定键——多账号签到时要把每个都算上。
+ */
+async function readSigninEntries(relPath: string): Promise<Array<{ date: string; claimed: boolean; result?: string }>> {
+  try {
+    const raw = await readFile(join(PROXY_ROOT, relPath), 'utf8')
+    const parsed = JSON.parse(raw) as unknown
+    if (typeof parsed !== 'object' || parsed === null) return []
+    const out: Array<{ date: string; claimed: boolean; result?: string }> = []
+    for (const v of Object.values(parsed as Record<string, unknown>)) {
+      if (typeof v !== 'object' || v === null) continue
+      const e = v as Record<string, unknown>
+      const date = typeof e['date'] === 'string' ? e['date'] : ''
+      if (date === '') continue
+      out.push({
+        date,
+        claimed: e['claimed'] === true,
+        ...(typeof e['result'] === 'string' ? { result: e['result'] } : {}),
+      })
+    }
+    return out
+  } catch {
+    // 文件不存在 / 坏 JSON：当作「今天没签到」。只会让用量偏高，不会编低。
+    return []
+  }
+}
+
+/**
+ * 采一次样：四家余额 + 当天各家的签到所得，写进历史文件。
+ *
+ * **全部失败时不写盘**：一次什么都取不到的采样（代理没起来、开机瞬间）写进去
+ * 会污染基准，次日算出一个假用量。要求至少有一家取到余额才落盘。
+ */
+async function sampleCreditHistory(nowMs: number = Date.now()): Promise<{ saved: boolean; date: string; sampled: HistoryProvider[] }> {
+  const date = localDateOf(nowMs)
+  const balances: Partial<Record<HistoryProvider, number>> = {}
+
+  const results = await Promise.allSettled(HISTORY_SOURCES.map(async (src) => {
+    const key = await readRegionKey(src.keyName)
+    if (key === null) return { provider: src.provider, balance: undefined }
+    const r = await fetchJson(src.creditsUrl, key, 'GET', 15000)
+    if (!r.ok) return { provider: src.provider, balance: undefined }
+    return { provider: src.provider, balance: src.pickBalance(r.data) }
+  }))
+  for (const r of results) {
+    if (r.status !== 'fulfilled') continue
+    const b = r.value.balance
+    if (typeof b === 'number' && Number.isFinite(b) && b >= 0) balances[r.value.provider] = b
+  }
+
+  const sampled = Object.keys(balances) as HistoryProvider[]
+  if (sampled.length === 0) {
+    log('warn', '积分历史：本次采样四家都没取到余额，跳过（不写脏基准）')
+    return { saved: false, date, sampled }
+  }
+
+  // 签到分与余额同刻采集，保证口径一致。
+  const signinEntries: Array<{ provider: HistoryProvider; date: string; claimed: boolean; result?: string }> = []
+  for (const src of HISTORY_SOURCES) {
+    const list = await readSigninEntries(src.signinRelPath)
+    for (const e of list) signinEntries.push({ provider: src.provider, ...e })
+  }
+  const signinCredits = sumSigninCredits(signinEntries, date)
+
+  const next: DailySample = { date, sampledAtMs: nowMs, balances, signinCredits }
+
+  const current = await loadCreditHistory()
+  const merged = pruneSamples(upsertSample(current, next), CREDIT_HISTORY_KEEP_DAYS)
+  await saveCreditHistory(merged)
+  log('info', `积分历史：已采样 ${date}（${sampled.join('/')}）`)
+  return { saved: true, date, sampled }
+}
+
+/** 读历史文件。文件不存在 → 空；存在但坏了 → 空（并记一条日志，不当成正常）。 */
+async function loadCreditHistory(): Promise<CreditHistoryFile> {
+  try {
+    const raw = await readFile(CREDIT_HISTORY_FILE, 'utf8')
+    const parsed = parseHistoryFile(raw)
+    if (parsed.samples.length === 0 && raw.trim() !== '' && raw.trim() !== '{"version":1,"samples":[]}') {
+      log('warn', '积分历史文件内容无法解析，本轮按空处理（不会覆盖原文件，除非有新采样）')
+    }
+    return parsed
+  } catch (error) {
+    // ENOENT 是正常的首次运行；其他错误（权限/占用）也不该让面板挂掉
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      log('warn', `读积分历史失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+    return { version: 1, samples: [] }
+  }
+}
+
+/** 原子写：先写临时文件再 rename，避免半截 JSON。 */
+async function saveCreditHistory(file: CreditHistoryFile): Promise<void> {
+  await mkdir(dirname(CREDIT_HISTORY_FILE), { recursive: true })
+  const tmp = `${CREDIT_HISTORY_FILE}.tmp`
+  await writeFile(tmp, JSON.stringify(file, null, 2) + '\n', 'utf8')
+  renameSync(tmp, CREDIT_HISTORY_FILE)
+}
+
+/** 某家今天签到领到多少（用于面板展示「今天签到 +N」的提示）。 */
+async function todaySigninCredits(date: string): Promise<Partial<Record<HistoryProvider, number>>> {
+  const entries: Array<{ provider: HistoryProvider; date: string; claimed: boolean; result?: string }> = []
+  for (const src of HISTORY_SOURCES) {
+    const list = await readSigninEntries(src.signinRelPath)
+    for (const e of list) entries.push({ provider: src.provider, ...e })
+  }
+  return sumSigninCredits(entries, date)
+}
+
+/**
+ * 面板用的历史视图：逐日用量 + 元信息。
+ *
+ * `lastSampledDate` 让面板能说清「数据到哪天为止」；最后一行永远是 null
+ * （尚未结算），面板据此显示「统计中」。
+ */
+async function creditHistoryView(limit = CREDIT_HISTORY_KEEP_DAYS): Promise<{
+  providers: Array<{ id: HistoryProvider; label: string }>
+  days: ReturnType<typeof dailyUsages>
+  sampledDates: string[]
+  lastSampledDate?: string
+  today: string
+  todaySignin: Partial<Record<HistoryProvider, number>>
+}> {
+  const file = await loadCreditHistory()
+  const today = localDateOf(Date.now())
+  return {
+    providers: HISTORY_PROVIDERS.map(id => ({ id, label: PROVIDER_LABELS[id] })),
+    days: dailyUsages(file, limit),
+    sampledDates: file.samples.map(s => s.date),
+    ...(file.samples.length > 0 ? { lastSampledDate: file.samples[file.samples.length - 1]!.date } : {}),
+    today,
+    todaySignin: await todaySigninCredits(today),
+  }
+}
+
 /**
  * 手动派遣。
  *
@@ -1432,6 +1679,24 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const data = await creditsCached('workbuddy', workbuddyCredits)
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
     }
+    if (req.method === 'GET' && url === '/api/credits/history') {
+      // 不缓存：每天只有 0 点写一次，读文件很便宜，而缓存会让「手动采样」后看不到结果。
+      const data = await creditHistoryView()
+      res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
+    }
+    if (req.method === 'POST' && url === '/api/credits/history/sample') {
+      // 手动补采一次（面板上「立即采样」）。用于装机当天就想看到基准、
+      // 或怀疑 0 点那一次因为没开机而漏了。
+      try {
+        const r = await sampleCreditHistory()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ...r, ...(r.saved ? {} : { message: '四家都没取到余额，未写入（避免脏基准）' }) }))
+        return
+      } catch (error) {
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) })); return
+      }
+    }
     if (req.method === 'GET' && url === '/api/trae/credits') {
       const data = await creditsCached('trae', traeCredits)
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); return
@@ -1619,6 +1884,32 @@ async function main(): Promise<void> {
     const updateTimer = setInterval(() => { void checkUpdates(true).catch(() => {}) }, UPDATE_CHECK_MS)
     updateTimer.unref?.()
   }
+
+  // 每日积分用量：对齐本地 0 点采一次基准，然后每天同一个时刻继续。
+  //
+  // 为什么必须由 hub 自己在 0 点采，而不是等面板轮询：面板不开就没有人读积分，
+  // 而「某天用量 = 该日基准 − 次日基准」要求基准点足够贴近 0 点，否则算出来的
+  // 差值里混进了 0 点到首次打开面板之间的消耗。
+  //
+  // 用 setTimeout 自调整链（而不是 setInterval 固定 24h）：每次按「到下一个本地
+  // 0 点」重新计算延迟，重启/系统休眠后的漂移不会累积。
+  const scheduleHistorySample = (): void => {
+    const delay = msUntilNextLocalMidnight()
+    // 兜底：函数理论上恒返回 (0, 24h]，真返回 NaN/0 时退到 1 小时，
+    // 避免 setTimeout(0) 忙循环反复打上游。
+    const safe = Number.isFinite(delay) && delay > 0 ? delay : 60 * 60 * 1000
+    const t = setTimeout(() => {
+      void sampleCreditHistory().catch((e: unknown) => {
+        log('warn', `积分历史 0 点采样失败：${e instanceof Error ? e.message : String(e)}`)
+      }).finally(() => { scheduleHistorySample() })
+    }, safe)
+    t.unref?.()
+  }
+  // 启动时先补一次：装机当天就能落下基准（否则要等到明天 0 点才有第一行）。
+  // 同一天重复采样会覆盖当天那条，所以重启不会造成重复行。
+  void sampleCreditHistory().catch((e: unknown) => {
+    log('warn', `积分历史启动采样失败：${e instanceof Error ? e.message : String(e)}`)
+  }).finally(() => { scheduleHistorySample() })
 
   const shutdown = (): void => { for (const s of sockets) s.destroy(); server.close(); process.exit(0) }
   process.on('SIGINT', shutdown)
